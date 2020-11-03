@@ -1,26 +1,24 @@
-from nose.tools import set_trace
-from circulation_exceptions import *
 import datetime
-from collections import defaultdict
-from threading import Thread
-import flask
 import logging
-import re
+import sys
 import time
+from threading import Thread
+
+import flask
 from flask_babel import lazy_gettext as _
 
-from core.config import CannotLoadConfiguration
+from circulation_exceptions import *
+from config import Configuration
 from core.cdn import cdnify
+from core.config import CannotLoadConfiguration
+from core.mirror import MirrorUploader
 from core.model import (
     get_one,
     CirculationEvent,
     Collection,
-    CollectionMissing,
     ConfigurationSetting,
     DeliveryMechanism,
     ExternalIntegration,
-    Identifier,
-    DataSource,
     Library,
     LicensePoolDeliveryMechanism,
     LicensePool,
@@ -29,10 +27,9 @@ from core.model import (
     Patron,
     RightsStatus,
     Session,
-)
+    ExternalIntegrationLink)
 from util.patron import PatronUtility
-from config import Configuration
-import sys
+
 
 class CirculationInfo(object):
 
@@ -194,7 +191,6 @@ class FulfillmentInfo(CirculationInfo):
             `content_type`).
         :param content_expires: A time after which the "next step"
             link or content will no longer be usable.
-
         """
         super(FulfillmentInfo, self).__init__(
             collection, data_source_name, identifier_type, identifier
@@ -212,6 +208,15 @@ class FulfillmentInfo(CirculationInfo):
         return "<FulfillmentInfo: content_link: %r, content_type: %r, content: %d bytes, expires: %r>" % (
             self.content_link, self.content_type, blength,
             self.fd(self.content_expires))
+
+    @property
+    def as_response(self):
+        """Bypass the normal process of creating a Flask Response.
+
+        :return: A Response object, or None if you're okay with the
+           normal process.
+        """
+        return None
 
 
 class APIAwareFulfillmentInfo(FulfillmentInfo):
@@ -333,7 +338,7 @@ class HoldInfo(CirculationInfo):
     :param end_date: When reserved book is expected to become available.
         Expected to be passed in date, not unicode format.
     :param hold_position:  Patron's place in the hold line. When not available,
-        default to be passed is None, which is equivalent to "first in line". 
+        default to be passed is None, which is equivalent to "first in line".
     """
 
     def __init__(self, collection, data_source_name, identifier_type,
@@ -431,6 +436,8 @@ class CirculationAPI(object):
         from enki import EnkiAPI
         from opds_for_distributors import OPDSForDistributorsAPI
         from odl import ODLAPI, SharedODLAPI
+        from api.lcp.collection import LCPAPI
+
         return {
             ExternalIntegration.OVERDRIVE : OverdriveAPI,
             ExternalIntegration.ODILO : OdiloAPI,
@@ -441,6 +448,7 @@ class CirculationAPI(object):
             OPDSForDistributorsAPI.NAME: OPDSForDistributorsAPI,
             ODLAPI.NAME: ODLAPI,
             SharedODLAPI.NAME: SharedODLAPI,
+            LCPAPI.NAME: LCPAPI
         }
 
     def api_for_license_pool(self, licensepool):
@@ -458,6 +466,36 @@ class CirculationAPI(object):
         if api.CAN_REVOKE_HOLD_WHEN_RESERVED:
             return True
         return False
+
+    def _try_to_sign_fulfillment_link(self, licensepool, fulfillment):
+        """Tries to sign the fulfilment URL (only works in the case when the collection has mirrors set up)
+
+        :param licensepool: License pool
+        :type licensepool: LicensePool
+
+        :param fulfillment: Fulfillment info
+        :type fulfillment: FulfillmentInfo
+
+        :return: Fulfillment info with a possibly signed URL
+        :rtype: FulfillmentInfo
+        """
+        mirror_types = [ExternalIntegrationLink.PROTECTED_ACCESS_BOOKS]
+        mirror = next(iter([
+            MirrorUploader.for_collection(licensepool.collection, mirror_type)
+            for mirror_type in mirror_types
+        ]))
+
+        if mirror:
+            signed_url = mirror.sign_url(fulfillment.content_link)
+
+            self.log.info(
+                'Fulfilment link {0} has been signed and translated into {1}'.format(
+                    fulfillment.content_link, signed_url)
+            )
+
+            fulfillment.content_link = signed_url
+
+        return fulfillment
 
     def _collect_event(self, patron, licensepool, name,
                        include_neighborhood=False):
@@ -527,11 +565,12 @@ class CirculationAPI(object):
             or `Hold` must be None, but not both.
         """
         # Short-circuit the request if the patron lacks borrowing
-        # privileges.
+        # privileges. This can happen for a few different reasons --
+        # fines, blocks, expired card, etc.
         PatronUtility.assert_borrowing_privileges(patron)
 
         now = datetime.datetime.utcnow()
-        if licensepool.open_access:
+        if licensepool.open_access or licensepool.self_hosted:
             # We can 'loan' open-access content ourselves just by
             # putting a row in the database.
             now = datetime.datetime.utcnow()
@@ -543,9 +582,7 @@ class CirculationAPI(object):
 
         # Okay, it's not an open-access book. This means we need to go
         # to an external service to get the book.
-        #
-        # This also means that our internal model of whether this book
-        # is currently on loan or on hold might be wrong.
+
         api = self.api_for_license_pool(licensepool)
         if not api:
             # If there's no API for the pool, the pool is probably associated
@@ -561,11 +598,6 @@ class CirculationAPI(object):
         content_link = content_expires = None
 
         internal_format = api.internal_format(delivery_mechanism)
-
-        if patron.fines:
-            max_fines = Configuration.max_outstanding_fines(patron.library)
-            if max_fines is not None and patron.fines > max_fines.amount:
-                raise OutstandingFines()
 
         # Do we (think we) already have this book out on loan?
         existing_loan = get_one(
@@ -585,7 +617,7 @@ class CirculationAPI(object):
 
             # TODO: This would be a great place to pass in only the
             # single API that needs to be synced.
-            self.sync_bookshelf(patron, pin)
+            self.sync_bookshelf(patron, pin, force=True)
             existing_loan = get_one(
                 self._db, Loan, patron=patron, license_pool=licensepool,
                 on_multiple='interchangeable'
@@ -593,76 +625,81 @@ class CirculationAPI(object):
 
         new_loan = False
 
-        loan_limit = patron.library.setting(Configuration.LOAN_LIMIT).int_value
-        non_open_access_loans_with_end_date = [loan for loan in patron.loans if loan.license_pool.open_access == False and loan.end]
-        at_loan_limit = (loan_limit and len(non_open_access_loans_with_end_date) >= loan_limit)
+        # Enforce any library-specific limits on loans or holds.
+        self.enforce_limits(patron, licensepool)
 
-        # If we're at the loan limit, skip trying to check out the book and just try
-        # to place a hold. Otherwise, try to check out the book even if we think it's
-        # not available.
-        if not at_loan_limit:
-            try:
-                loan_info = api.checkout(
-                    patron, pin, licensepool, internal_format
-                )
+        # Since that didn't raise an exception, we know that the
+        # patron is able to get a loan or a hold. There are race
+        # conditions that will allow someone to get a hold in excess
+        # of their hold limit (because we thought they were getting a
+        # loan but someone else checked out the book right before we
+        # got to it) but they're rare and not serious.
 
-                if isinstance(loan_info, HoldInfo):
-                    # If the API couldn't give us a loan, it may have given us
-                    # a hold instead of raising an exception.
-                    hold_info = loan_info
-                    loan_info = None
-                else:
-                    # We asked the API to create a loan and it gave us a
-                    # LoanInfo object, rather than raising an exception like
-                    # AlreadyCheckedOut.
-                    #
-                    # For record-keeping purposes we're going to treat this as
-                    # a newly transacted loan, although it's possible that the
-                    # API does something unusual like return LoanInfo instead
-                    # of raising AlreadyCheckedOut.
-                    new_loan = True
-            except AlreadyCheckedOut:
-                # This is good, but we didn't get the real loan info.
-                # Just fake it.
-                identifier = licensepool.identifier
-                loan_info = LoanInfo(
-                    licensepool.collection,
-                    licensepool.data_source,
-                    identifier.type,
-                    identifier.identifier,
-                    start_date=None,
-                    end_date=now + datetime.timedelta(hours=1)
+        # We try to check out the book even if we believe it's not
+        # available -- someone else may have checked it in since we
+        # last looked.
+        try:
+            loan_info = api.checkout(
+                patron, pin, licensepool, internal_format
+            )
+
+            if isinstance(loan_info, HoldInfo):
+                # If the API couldn't give us a loan, it may have given us
+                # a hold instead of raising an exception.
+                hold_info = loan_info
+                loan_info = None
+            else:
+                # We asked the API to create a loan and it gave us a
+                # LoanInfo object, rather than raising an exception like
+                # AlreadyCheckedOut.
+                #
+                # For record-keeping purposes we're going to treat this as
+                # a newly transacted loan, although it's possible that the
+                # API does something unusual like return LoanInfo instead
+                # of raising AlreadyCheckedOut.
+                new_loan = True
+        except AlreadyCheckedOut:
+            # This is good, but we didn't get the real loan info.
+            # Just fake it.
+            identifier = licensepool.identifier
+            loan_info = LoanInfo(
+                licensepool.collection,
+                licensepool.data_source,
+                identifier.type,
+                identifier.identifier,
+                start_date=None,
+                end_date=now + datetime.timedelta(hours=1)
+            )
+            if existing_loan:
+                loan_info.external_identifier=existing_loan.external_identifier
+        except AlreadyOnHold:
+            # We're trying to check out a book that we already have on hold.
+            hold_info = HoldInfo(
+                licensepool.collection, licensepool.data_source,
+                licensepool.identifier.type, licensepool.identifier.identifier,
+                None, None, None
+            )
+        except NoAvailableCopies:
+            if existing_loan:
+                # The patron tried to renew a loan but there are
+                # people waiting in line for them to return the book,
+                # so renewals are not allowed.
+                raise CannotRenew(
+                    _("You cannot renew a loan if other patrons have the work on hold.")
                 )
-                if existing_loan:
-                    loan_info.external_identifier=existing_loan.external_identifier
-            except AlreadyOnHold:
-                # We're trying to check out a book that we already have on hold.
-                hold_info = HoldInfo(
-                    licensepool.collection, licensepool.data_source,
-                    licensepool.identifier.type, licensepool.identifier.identifier,
-                    None, None, None
-                )
-            except NoAvailableCopies:
-                if existing_loan:
-                    # The patron tried to renew a loan but there are
-                    # people waiting in line for them to return the book,
-                    # so renewals are not allowed.
-                    raise CannotRenew(
-                        _("You cannot renew a loan if other patrons have the work on hold.")
-                    )
-                else:
-                    # That's fine, we'll just (try to) place a hold.
-                    #
-                    # Since the patron incorrectly believed there were
-                    # copies available, update availability information
-                    # immediately.
-                    api.update_availability(licensepool)
-            except NoLicenses, e:
+            else:
+                # That's fine, we'll just (try to) place a hold.
+                #
                 # Since the patron incorrectly believed there were
-                # licenses available, update availability information
+                # copies available, update availability information
                 # immediately.
                 api.update_availability(licensepool)
-                raise e
+        except NoLicenses, e:
+            # Since the patron incorrectly believed there were
+            # licenses available, update availability information
+            # immediately.
+            api.update_availability(licensepool)
+            raise e
 
         if loan_info:
             # We successfuly secured a loan.  Now create it in our
@@ -698,10 +735,6 @@ class CirculationAPI(object):
         # Checking out a book didn't work, so let's try putting
         # the book on hold.
         if not hold_info:
-            hold_limit = patron.library.setting(Configuration.HOLD_LIMIT).int_value
-            if hold_limit and len(patron.holds) >= hold_limit:
-                raise PatronHoldLimitReached()
-
             try:
                 hold_info = api.place_hold(
                     patron, pin, licensepool,
@@ -713,11 +746,6 @@ class CirculationAPI(object):
                     licensepool.identifier.type, licensepool.identifier.identifier,
                     None, None, None
                 )
-            except CannotHold, e:
-                if at_loan_limit:
-                    raise PatronLoanLimitReached()
-                else:
-                    raise e
 
         # It's pretty rare that we'd go from having a loan for a book
         # to needing to put it on hold, but we do check for that case.
@@ -742,6 +770,78 @@ class CirculationAPI(object):
             self._db.delete(existing_loan)
         __transaction.commit()
         return None, hold, is_new
+
+    def enforce_limits(self, patron, pool):
+        """Enforce library-specific patron loan and hold limits.
+
+        :param patron: A Patron.
+        :param pool: A LicensePool the patron is trying to access. As
+           a side effect, this method may update `pool` with the latest
+           availability information from the remote API.
+        :raises PatronLoanLimitReached: If `pool` is currently
+            available but the patron is at their loan limit.
+        :raises PatronHoldLimitReached: If `pool` is currently
+            unavailable and the patron is at their hold limit.
+        """
+        at_loan_limit = self.patron_at_loan_limit(patron)
+        at_hold_limit = self.patron_at_hold_limit(patron)
+
+        if not at_loan_limit and not at_hold_limit:
+            # This patron can take out either a loan or a hold, so the
+            # limits don't apply.
+            return
+
+        if at_loan_limit and at_hold_limit:
+            # This patron can neither take out a loan or place a hold.
+            # Raise PatronLoanLimitReached for the most understandable
+            # error message.
+            raise PatronLoanLimitReached(library=patron.library)
+
+        # At this point it's important that we get up-to-date
+        # availability information about this LicensePool, to reduce
+        # the risk that (e.g.) we apply the loan limit to a book that
+        # would be placed on hold instead.
+        api = self.api_for_license_pool(pool)
+        api.update_availability(pool)
+
+        currently_available = pool.licenses_available > 0
+        if currently_available and at_loan_limit:
+             raise PatronLoanLimitReached(library=patron.library)
+        if not currently_available and at_hold_limit:
+            raise PatronHoldLimitReached(library=patron.library)
+
+    def patron_at_loan_limit(self, patron):
+        """Is the given patron at their loan limit?
+
+        This doesn't belong in Patron because the loan limit is not core functionality.
+        Of course, Patron itself isn't really core functionality...
+
+        :param patron: A Patron.
+        """
+        loan_limit = patron.library.setting(Configuration.LOAN_LIMIT).int_value
+        if loan_limit is None:
+            return False
+
+        # Open-access loans, and loans of indefinite duration, don't count towards the loan limit
+        # because they don't block anyone else.
+        non_open_access_loans_with_end_date = [
+            loan for loan in patron.loans
+            if loan.license_pool and loan.license_pool.open_access == False and loan.end
+        ]
+        return loan_limit and len(non_open_access_loans_with_end_date) >= loan_limit
+
+    def patron_at_hold_limit(self, patron):
+        """Is the given patron at their hold limit?
+
+        This doesn't belong in Patron because the hold limit is not core functionality.
+        Of course, Patron itself isn't really core functionality...
+
+        :param patron: A Patron.
+        """
+        hold_limit = patron.library.setting(Configuration.HOLD_LIMIT).int_value
+        if hold_limit is None:
+            return False
+        return hold_limit and len(patron.holds) >= hold_limit
 
     def can_fulfill_without_loan(self, patron, pool, lpdm):
         """Can we deliver the given book in the given format to the given
@@ -799,7 +899,7 @@ class CirculationAPI(object):
                 # Sync and try again.
                 # TODO: Pass in only the single collection or LicensePool
                 # that needs to be synced.
-                self.sync_bookshelf(patron, pin)
+                self.sync_bookshelf(patron, pin, force=True)
                 return self.fulfill(
                     patron, pin, licensepool=licensepool,
                     delivery_mechanism=delivery_mechanism,
@@ -815,13 +915,16 @@ class CirculationAPI(object):
                   requested_delivery_mechanism=delivery_mechanism.delivery_mechanism.name)
             )
 
-        if licensepool.open_access:
+        if licensepool.open_access or licensepool.self_hosted:
             # We ignore the vendor-specific arguments when doing
             # open-access fulfillment, because we just don't support
             # partial fulfillment of open-access content.
             fulfillment = self.fulfill_open_access(
                 licensepool, delivery_mechanism.delivery_mechanism,
             )
+
+            if licensepool.self_hosted:
+                fulfillment = self._try_to_sign_fulfillment_link(licensepool, fulfillment)
         else:
             api = self.api_for_license_pool(licensepool)
             internal_format = api.internal_format(delivery_mechanism)
@@ -917,6 +1020,7 @@ class CirculationAPI(object):
             __transaction = self._db.begin_nested()
             logging.info("In revoke_loan(), deleting loan #%d" % loan.id)
             self._db.delete(loan)
+            patron.last_loan_activity_sync = None
             __transaction.commit()
 
             # Send out an analytics event to record the fact that
@@ -949,6 +1053,7 @@ class CirculationAPI(object):
         if hold:
             __transaction = self._db.begin_nested()
             self._db.delete(hold)
+            patron.last_loan_activity_sync = None
             __transaction.commit()
 
             # Send out an analytics event to record the fact that
@@ -1048,15 +1153,41 @@ class CirculationAPI(object):
             Hold.patron==patron
         )
 
-    def sync_bookshelf(self, patron, pin):
+    def sync_bookshelf(self, patron, pin, force=False):
+        """Sync our internal model of a patron's bookshelf with any external
+        vendors that provide books to the patron's library.
 
-        # Get the external view of the patron's current state.
-        remote_loans, remote_holds, complete = self.patron_activity(patron, pin)
-
+        :param patron: A Patron.
+        :param pin: The password authenticating the patron; used by some vendors
+           that perform a cross-check against the library ILS.
+        :param force: If this is True, the method will call out to external
+           vendors even if it looks like the system has up-to-date information
+           about the patron.
+        """
         # Get our internal view of the patron's current state.
-        __transaction = self._db.begin_nested()
         local_loans = self.local_loans(patron)
         local_holds = self.local_holds(patron)
+
+        if patron and patron.last_loan_activity_sync and not force:
+            # Our local data is considered fresh, so we can return it
+            # without calling out to the vendor APIs.
+            return local_loans, local_holds
+
+        # Assuming everything goes well, we will set
+        # Patron.last_loan_activity_sync to this value -- the moment
+        # just before we started contacting the vendor APIs.
+        last_loan_activity_sync = datetime.datetime.utcnow()
+
+        # Update the external view of the patron's current state.
+        remote_loans, remote_holds, complete = self.patron_activity(patron, pin)
+        __transaction = self._db.begin_nested()
+
+        if not complete:
+            # We were not able to get a complete picture of the
+            # patron's loan activity. Until we are able to do that, we
+            # should never assume that our internal model of the
+            # patron's loans is good enough to cache.
+            last_loan_activity_sync = None
 
         now = datetime.datetime.utcnow()
         local_loans_by_identifier = {}
@@ -1178,6 +1309,11 @@ class CirculationAPI(object):
                 if hold.license_pool.collection_id in self.collection_ids_for_sync:
                     self._db.delete(hold)
 
+        # Now that we're in sync (or not), set last_loan_activity_sync
+        # to the conservative value obtained earlier.
+        if patron:
+            patron.last_loan_activity_sync = last_loan_activity_sync
+
         __transaction.commit()
         return active_loans, active_holds
 
@@ -1253,6 +1389,8 @@ class BaseCirculationAPI(object):
     def internal_format(self, delivery_mechanism):
         """Look up the internal format for this delivery mechanism or
         raise an exception.
+
+        :param delivery_mechanism: A LicensePoolDeliveryMechanism
         """
         if not delivery_mechanism:
             return None

@@ -18,7 +18,6 @@ import pypostalcode
 from tests.admin.controller.test_controller import SettingsControllerTest
 import urllib
 import uszipcode
-from werkzeug import MultiDict
 
 class TestGeographicValidator(SettingsControllerTest):
     def test_validate_geographic_areas(self):
@@ -65,7 +64,7 @@ class TestGeographicValidator(SettingsControllerTest):
 
         # Validator converts Canadian 2-letter abbreviations into province names, without needing to ask the registry.
         response = mock.validate_geographic_areas('["NL"]', self._db)
-        eq_(response, '{"CA": ["Newfoundland and Labrador"], "US": []}')
+        eq_(response, {"CA": ["Newfoundland and Labrador"], "US": []})
         eq_(mock.value, None)
 
         # County with wrong state
@@ -97,7 +96,13 @@ class TestGeographicValidator(SettingsControllerTest):
         # The registry successfully finds the place
         mock.find_location_through_registry = mock.mock_find_location_through_registry_success
         response = mock.validate_geographic_areas('["Victoria, BC"]', self._db)
-        eq_(response, '{"CA": ["Victoria, BC"], "US": []}')
+        eq_(response, {"CA": ["Victoria, BC"], "US": []})
+
+    def test_format_as_string(self):
+        # GeographicValidator.format_as_string just turns its output into JSON.
+        value = {"CA": ["Victoria, BC"], "US": []}
+        as_string = GeographicValidator().format_as_string(value)
+        eq_(as_string, json.dumps(value))
 
     def test_find_location_through_registry(self):
         get = self.do_request

@@ -15,9 +15,14 @@ from werkzeug.exceptions import HTTPException
 
 from app import app, babel
 
+# We use URIs as identifiers throughout the application, meaning that
+# we never want werkzeug's merge_slashes feature.
+app.url_map.merge_slashes = False
+
 from config import Configuration
 from core.app_server import (
     ErrorHandler,
+    compressible,
     returns_problem_detail,
 )
 from core.model import ConfigurationSetting
@@ -208,17 +213,20 @@ def library_dir_route(path, *args, **kwargs):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def index():
     return app.manager.index_controller()
 
 @library_route('/authentication_document')
 @has_library
 @returns_problem_detail
+@compressible
 def authentication_document():
     return app.manager.index_controller.authentication_document()
 
 @library_route('/public_key_document')
 @returns_problem_detail
+@compressible
 def public_key_document():
     return app.manager.index_controller.public_key_document()
 
@@ -227,6 +235,7 @@ def public_key_document():
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def acquisition_groups(lane_identifier):
     return app.manager.opds_feeds.groups(lane_identifier)
 
@@ -235,6 +244,7 @@ def acquisition_groups(lane_identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def feed(lane_identifier):
     return app.manager.opds_feeds.feed(lane_identifier)
 
@@ -243,6 +253,7 @@ def feed(lane_identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def navigation_feed(lane_identifier):
     return app.manager.opds_feeds.navigation(lane_identifier)
 
@@ -250,6 +261,7 @@ def navigation_feed(lane_identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def crawlable_library_feed():
     return app.manager.opds_feeds.crawlable_library_feed()
 
@@ -257,12 +269,14 @@ def crawlable_library_feed():
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def crawlable_list_feed(list_name):
     return app.manager.opds_feeds.crawlable_list_feed(list_name)
 
 @app.route('/collections/<collection_name>/crawlable')
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def crawlable_collection_feed(collection_name):
     return app.manager.opds_feeds.crawlable_collection_feed(collection_name)
 
@@ -313,6 +327,7 @@ def shared_collection_revoke_hold(collection_name, hold_id):
 @library_route('/marc')
 @has_library
 @returns_problem_detail
+@compressible
 def marc_page():
     return app.manager.marc_records.download_page()
 
@@ -321,6 +336,7 @@ def marc_page():
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def lane_search(lane_identifier):
     return app.manager.opds_feeds.search(lane_identifier)
 
@@ -337,6 +353,7 @@ def patron_profile():
 @allows_patron_web
 @requires_auth
 @returns_problem_detail
+@compressible
 def active_loans():
     return app.manager.loans.sync()
 
@@ -345,6 +362,7 @@ def active_loans():
 @allows_patron_web
 @requires_auth
 @returns_problem_detail
+@compressible
 def annotations():
     return app.manager.annotations.container()
 
@@ -353,14 +371,16 @@ def annotations():
 @allows_patron_web
 @requires_auth
 @returns_problem_detail
+@compressible
 def annotation_detail(annotation_id):
     return app.manager.annotations.detail(annotation_id)
 
-@library_route('/annotations/<identifier_type>/<path:identifier>/', methods=['GET'])
+@library_route('/annotations/<identifier_type>/<path:identifier>', methods=['GET'])
 @has_library
 @allows_patron_web
 @requires_auth
 @returns_problem_detail
+@compressible
 def annotations_for_work(identifier_type, identifier):
     return app.manager.annotations.container_for_work(identifier_type, identifier)
 
@@ -373,6 +393,11 @@ def annotations_for_work(identifier_type, identifier):
 @returns_problem_detail
 def borrow(identifier_type, identifier, mechanism_id=None):
     return app.manager.loans.borrow(identifier_type, identifier, mechanism_id)
+
+@library_route('/works/<license_pool_id>/fulfill/<mechanism_id>/<part>/rbdproxy/<bearer>')
+@has_library
+def proxy_rbdigital_patron_requests(license_pool_id, mechanism_id, part, bearer):
+    return app.manager.rbdproxy.proxy(bearer)
 
 @library_route('/works/<license_pool_id>/fulfill')
 @library_route('/works/<license_pool_id>/fulfill/<mechanism_id>')
@@ -403,6 +428,7 @@ def loan_or_hold_detail(identifier_type, identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def work():
     return app.manager.urn_lookup.work_lookup('work')
 
@@ -412,6 +438,7 @@ def work():
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def contributor(contributor_name, languages, audiences):
     return app.manager.work_controller.contributor(contributor_name, languages, audiences)
 
@@ -421,6 +448,7 @@ def contributor(contributor_name, languages, audiences):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def series(series_name, languages, audiences):
     return app.manager.work_controller.series(series_name, languages, audiences)
 
@@ -428,6 +456,7 @@ def series(series_name, languages, audiences):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def permalink(identifier_type, identifier):
     return app.manager.work_controller.permalink(identifier_type, identifier)
 
@@ -435,6 +464,7 @@ def permalink(identifier_type, identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def recommendations(identifier_type, identifier):
     return app.manager.work_controller.recommendations(identifier_type, identifier)
 
@@ -442,6 +472,7 @@ def recommendations(identifier_type, identifier):
 @has_library
 @allows_patron_web
 @returns_problem_detail
+@compressible
 def related_books(identifier_type, identifier):
     return app.manager.work_controller.related(identifier_type, identifier)
 
@@ -516,6 +547,43 @@ def oauth_authenticate():
 @returns_problem_detail
 def oauth_callback():
     return app.manager.oauth_controller.oauth_authentication_callback(app.manager._db, flask.request.args)
+
+# Route that redirects to the authentication URL for a SAML provider
+@library_route('/saml_authenticate')
+@has_library
+@returns_problem_detail
+def saml_authenticate():
+    return app.manager.saml_controller.saml_authentication_redirect(flask.request.args, app.manager._db)
+
+# Redirect URI for SAML providers
+# NOTE: we cannot use @has_library decorator and append a library's name to saml_calback route
+# (e.g. https://cm.org/LIBRARY_NAME/saml_callback).
+# The URL of the SP's assertion consumer service (saml_callback) should be constant:
+# SP's metadata is registered in the IdP and cannot change.
+# If we try to append a library's name to the ACS's URL sent as a part of the SAML request,
+# the IdP will fail this request because the URL mentioned in the request and
+# the URL saved in the SP's metadata configured in this IdP will differ.
+# Library's name is passed as a part of the relay state and processed in SAMLController.saml_authentication_callback
+@returns_problem_detail
+@app.route("/saml_callback", methods=['POST'])
+def saml_callback():
+    return app.manager.saml_controller.saml_authentication_callback(request, app.manager._db)
+
+
+@library_route('/lcp/hint')
+@has_library
+@requires_auth
+@returns_problem_detail
+def lcp_passphrase():
+    return app.manager.lcp_controller.get_lcp_passphrase()
+
+
+@library_route('/lcp/licenses/<license_id>')
+@has_library
+@requires_auth
+@returns_problem_detail
+def lcp_license(license_id):
+    return app.manager.lcp_controller.get_lcp_license(license_id)
 
 # Loan notifications for ODL distributors, eg. Feedbooks
 @library_route('/odl_notify/<loan_id>', methods=['GET', 'POST'])

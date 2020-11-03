@@ -1,4 +1,5 @@
 import contextlib
+import datetime
 import json
 import logging
 from collections import defaultdict
@@ -105,6 +106,50 @@ class VendorIDTest(DatabaseTest):
         self.adobe_vendor_id.set_setting(
             AuthdataUtility.OTHER_LIBRARIES_KEY, other_libraries
         )
+
+
+class MonitorTest(DatabaseTest):
+
+    @property
+    def ts(self):
+        """Make the timestamp used by run() when calling run_once().
+
+        This makes it easier to test run_once() in isolation.
+        """
+        return self.monitor.timestamp().to_data()
+
+
+class AnnouncementTest(object):
+    """A test that needs to create announcements."""
+
+    # Create raw data to be used in tests.
+    format = '%Y-%m-%d'
+    today = datetime.date.today()
+    yesterday = (today - datetime.timedelta(days=1)).strftime(format)
+    tomorrow = (today + datetime.timedelta(days=1)).strftime(format)
+    a_week_ago = (today - datetime.timedelta(days=7)).strftime(format)
+    in_a_week = (today + datetime.timedelta(days=7)).strftime(format)
+    today = today.strftime(format)
+
+    # This announcement is active.
+    active = dict(
+        id="active",
+        start=today,
+        finish=tomorrow,
+        content="A sample announcement."
+    )
+
+    # This announcement expired yesterday.
+    expired = dict(active)
+    expired['id'] = 'expired'
+    expired['start'] = a_week_ago
+    expired['finish'] = yesterday
+
+    # This announcement should be displayed starting tomorrow.
+    forthcoming = dict(active)
+    forthcoming['id'] = 'forthcoming'
+    forthcoming['start'] = tomorrow
+    forthcoming['finish'] = in_a_week
 
 
 class MockRemoteAPI(BaseCirculationAPI):

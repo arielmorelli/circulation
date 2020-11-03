@@ -9,6 +9,8 @@ from Crypto.Cipher import PKCS1_OAEP
 
 from flask_babel import lazy_gettext as _
 
+from .announcements import Announcements
+
 from core.config import (
     Configuration as CoreConfiguration,
     CannotLoadConfiguration,
@@ -26,14 +28,28 @@ class Configuration(CoreConfiguration):
 
     DEFAULT_OPDS_FORMAT = "simple_opds_entry"
 
-    # The name of the sitewide url that points to the patron web catalog.
-    PATRON_WEB_CLIENT_URL = u"Patron Web Client"
+    # The list of patron web urls allowed to access this CM
+    PATRON_WEB_HOSTNAMES = u"patron_web_hostnames"
 
     # The name of the sitewide secret used to sign cookies for admin login.
     SECRET_KEY = u"secret_key"
 
     # The name of the setting that controls how long static files are cached.
     STATIC_FILE_CACHE_TIME = u"static_file_cache_time"
+
+    # A custom link to a Terms of Service document to be understood by
+    # users of the administrative interface.
+    #
+    # This is _not_ the end-user terms of service for SimplyE or any
+    # other mobile client. The default value links to the terms of
+    # service for a library's inclusion in the SimplyE library
+    # registry.
+    CUSTOM_TOS_HREF = "tos_href"
+    DEFAULT_TOS_HREF = "https://librarysimplified.org/simplyetermsofservice2/"
+
+    # Custom text for the link defined in CUSTOM_TOS_LINK.
+    CUSTOM_TOS_TEXT = "tos_text"
+    DEFAULT_TOS_TEXT = "Terms of Service for presenting e-reading materials through NYPL's SimplyE mobile app"
 
     # A short description of the library, used in its Authentication
     # for OPDS document.
@@ -55,6 +71,7 @@ class Configuration(CoreConfiguration):
     # The name of the per-library setting that sets the default email
     # address to use when notifying patrons of changes.
     DEFAULT_NOTIFICATION_EMAIL_ADDRESS = u"default_notification_email_address"
+    STANDARD_NOREPLY_EMAIL_ADDRESS = "noreply@librarysimplified.org"
 
     # The name of the per-library setting that sets the email address
     # of the Designated Agent for copyright complaints
@@ -86,10 +103,10 @@ class Configuration(CoreConfiguration):
     DEFAULT_COLOR_SCHEME = "blue"
 
     # The color options for web applications to use for this library.
-    WEB_BACKGROUND_COLOR = "web-background-color"
-    WEB_FOREGROUND_COLOR = "web-foreground-color"
-    DEFAULT_WEB_BACKGROUND_COLOR = "#000000"
-    DEFAULT_WEB_FOREGROUND_COLOR = "#ffffff"
+    WEB_PRIMARY_COLOR = "web-primary-color"
+    WEB_SECONDARY_COLOR = "web-secondary-color"
+    DEFAULT_WEB_PRIMARY_COLOR = "#377F8B"
+    DEFAULT_WEB_SECONDARY_COLOR = "#D53F34"
 
     # A link to a CSS file for customizing the catalog display in web applications.
     WEB_CSS_FILE = "web-css-file"
@@ -158,7 +175,7 @@ class Configuration(CoreConfiguration):
     SITEWIDE_SETTINGS = CoreConfiguration.SITEWIDE_SETTINGS + [
         {
             "key": BEARER_TOKEN_SIGNING_SECRET,
-            "label": _("Internal signing secret for OAuth bearer tokens"),
+            "label": _("Internal signing secret for OAuth and SAML bearer tokens"),
             "required": True,
         },
         {
@@ -167,12 +184,10 @@ class Configuration(CoreConfiguration):
             "required": True,
         },
         {
-            "key": PATRON_WEB_CLIENT_URL,
-            "label": _("URL of the web catalog for patrons"),
+            "key": PATRON_WEB_HOSTNAMES,
+            "label": _("Hostnames for web application access"),
             "required": True,
-            "format": "url",
-            "allowed": ["*"],
-            "description": _("You can set this to '*' in development, but you must use a real URL in production in order to prevent unauthorized CORS requests.")
+            "description": _("Only web applications from these hosts can access this circulation manager. This can be a single hostname (http://catalog.library.org) or a pipe-separated list of hostnames (http://catalog.library.org|https://beta.library.org). You must include the scheme part of the URI (http:// or https://). You can also set this to '*' to allow access from any host, but you must not do this in a production environment -- only during development.")
         },
         {
             "key": STATIC_FILE_CACHE_TIME,
@@ -180,6 +195,20 @@ class Configuration(CoreConfiguration):
             "required": True,
             "type": "number",
         },
+        {
+            "key": CUSTOM_TOS_HREF,
+            "label": _("Custom Terms of Service link"),
+            "required": False,
+            "default": DEFAULT_TOS_HREF,
+            "description": _("If your inclusion in the SimplyE mobile app is governed by terms other than the default, put the URL to those terms in this link so that librarians will have access to them. This URL will be used for all libraries on this circulation manager.")
+        },
+        {
+            "key": CUSTOM_TOS_TEXT,
+            "label": _("Custom Terms of Service link text"),
+            "required": False,
+            "default": DEFAULT_TOS_TEXT,
+            "description": _("Custom text for the Terms of Service link in the footer of these administrative interface pages. This is primarily useful if you're not connecting this circulation manager to the SimplyE mobile app. This text will be used for all libraries on this circulation manager.")
+        }
     ]
 
     LIBRARY_SETTINGS = CoreConfiguration.LIBRARY_SETTINGS + [
@@ -188,6 +217,13 @@ class Configuration(CoreConfiguration):
             "label": _("A short description of this library"),
             "description": _("This will be shown to people who aren't sure they've chosen the right library."),
             "category": "Basic Information",
+        },
+        {
+            "key": Announcements.SETTING_NAME,
+            "label": _("Scheduled announcements"),
+            "description": _("Announcements will be displayed to authenticated patrons."),
+            "category": "Announcements",
+            "type": "announcements"
         },
         {
             "key": HELP_EMAIL,
@@ -225,8 +261,9 @@ class Configuration(CoreConfiguration):
         },
         {
             "key": DEFAULT_NOTIFICATION_EMAIL_ADDRESS,
-            "label": _("Default email address to use when sending vendor hold notifications"),
-            "description": _('This should be an address controlled by the library which rejects or trashes all email sent to it. Vendor hold notifications contain sensitive patron information, but <a href="https://confluence.nypl.org/display/SIM/About+Hold+Notifications" target="_blank">cannot be forwarded to patrons</a> because they contain vendor-specific instructions.'),
+            "label": _("Write-only email address for vendor hold notifications"),
+            "description": _('This address must trash all email sent to it. Vendor hold notifications contain sensitive patron information, but <a href="https://confluence.nypl.org/display/SIM/About+Hold+Notifications" target="_blank">cannot be forwarded to patrons</a> because they contain vendor-specific instructions.<br/>The default address will work, but for greater security, set up your own address that trashes all incoming email.'),
+            "default": STANDARD_NOREPLY_EMAIL_ADDRESS,
             "required": True,
             "format": "email",
         },
@@ -258,19 +295,19 @@ class Configuration(CoreConfiguration):
             "category": "Client Interface Customization",
         },
         {
-            "key": WEB_BACKGROUND_COLOR,
-            "label": _("Web background color"),
-            "description": _("This tells web applications what background color to use. Must have sufficient contrast with the foreground color."),
+            "key": WEB_PRIMARY_COLOR,
+            "label": _("Web primary color"),
+            "description": _("This is the brand primary color for the web application. Must have sufficient contrast with white."),
             "type": "color-picker",
-            "default": DEFAULT_WEB_BACKGROUND_COLOR,
+            "default": DEFAULT_WEB_PRIMARY_COLOR,
             "category": "Client Interface Customization",
         },
         {
-            "key": WEB_FOREGROUND_COLOR,
-            "label": _("Web foreground color"),
-            "description": _("This tells web applications what foreground color to use. Must have sufficient contrast with the background color."),
+            "key": WEB_SECONDARY_COLOR,
+            "label": _("Web secondary color"),
+            "description": _("This is the brand secondary color for the web application. Must have sufficient contrast with white."),
             "type": "color-picker",
-            "default": DEFAULT_WEB_FOREGROUND_COLOR,
+            "default": DEFAULT_WEB_SECONDARY_COLOR,
             "category": "Client Interface Customization",
         },
         {
@@ -315,7 +352,8 @@ class Configuration(CoreConfiguration):
             "description": _("The library focuses on serving patrons in this geographic area. In most cases this will be a city name like <code>Springfield, OR</code>."),
             "category": "Geographic Areas",
             "format": "geographic",
-            "instructions": AREA_INPUT_INSTRUCTIONS
+            "instructions": AREA_INPUT_INSTRUCTIONS,
+            "capitalize": True
         },
         {
             "key": LIBRARY_SERVICE_AREA,
@@ -324,7 +362,8 @@ class Configuration(CoreConfiguration):
             "description": _("The full geographic area served by this library. In most cases this is the same as the focus area and can be left blank, but it may be a larger area such as a US state (which should be indicated by its abbreviation, like <code>OR</code>)."),
             "category": "Geographic Areas",
             "format": "geographic",
-            "instructions": AREA_INPUT_INSTRUCTIONS
+            "instructions": AREA_INPUT_INSTRUCTIONS,
+            "capitalize": True
         },
         {
             "key": MAX_OUTSTANDING_FINES,
@@ -382,6 +421,7 @@ class Configuration(CoreConfiguration):
             "description": _("A URL where someone who doesn't have a library card yet can sign up for one."),
             "format": "url",
             "category": "Patron Support",
+            "allowed": ["nypl.card-creator:https://patrons.librarysimplified.org/"]
         },
         {
             "key": LARGE_COLLECTION_LANGUAGES,

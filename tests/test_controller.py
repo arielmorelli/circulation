@@ -4,10 +4,13 @@ from nose.tools import (
     eq_,
     set_trace,
 )
+import calendar
 from contextlib import contextmanager
+import email
 import os
 import datetime
-import re
+import time
+import urlparse
 from wsgiref.handlers import format_date_time
 from time import mktime
 from decimal import Decimal
@@ -15,13 +18,13 @@ from decimal import Decimal
 import flask
 from flask import (
     url_for,
-    Response,
+    Response as FlaskResponse,
 )
 from flask_sqlalchemy_session import (
     current_session,
     flask_scoped_session,
 )
-from werkzeug import ImmutableMultiDict
+from werkzeug.datastructures import ImmutableMultiDict
 from werkzeug.exceptions import NotFound
 
 from . import DatabaseTest
@@ -81,6 +84,7 @@ from core.entrypoint import (
 )
 from core.local_analytics_provider import LocalAnalyticsProvider
 from core.model import (
+    Admin,
     Annotation,
     CachedMARCFile,
     Collection,
@@ -102,6 +106,7 @@ from core.model import (
     CachedFeed,
     Work,
     CirculationEvent,
+    LinkRelations,
     LicensePoolDeliveryMechanism,
     PresentationCalculationPolicy,
     RightsStatus,
@@ -125,6 +130,7 @@ from core.user_profile import (
     ProfileController,
     ProfileStorage,
 )
+from core.util.flask_util import Response
 from core.util.problem_detail import ProblemDetail
 from core.util.http import RemoteIntegrationException
 
@@ -149,6 +155,7 @@ import base64
 import feedparser
 from core.opds import (
     AcquisitionFeed,
+    NavigationFacets,
     NavigationFeed,
 )
 from core.util.opds_writer import (
@@ -169,6 +176,7 @@ import random
 import json
 import urllib
 from core.analytics import Analytics
+from core.lane import BaseFacets
 from core.util.authentication_for_opds import AuthenticationForOPDSDocument
 from api.registry import Registration
 
@@ -440,7 +448,7 @@ class TestCirculationManager(CirculationControllerTest):
         # We also set up some patron web client settings that will
         # be loaded.
         ConfigurationSetting.sitewide(
-            self._db, Configuration.PATRON_WEB_CLIENT_URL).value = "http://sitewide/1234"
+            self._db, Configuration.PATRON_WEB_HOSTNAMES).value = "http://sitewide/1234"
         registry = self._external_integration(
             protocol="some protocol", goal=ExternalIntegration.DISCOVERY_GOAL
         )
@@ -495,9 +503,15 @@ class TestCirculationManager(CirculationControllerTest):
 
         # The sitewide patron web domain can also be set to *.
         ConfigurationSetting.sitewide(
-            self._db, Configuration.PATRON_WEB_CLIENT_URL).value = "*"
+            self._db, Configuration.PATRON_WEB_HOSTNAMES).value = "*"
         self.manager.load_settings()
         eq_(set(["*", "http://registration"]), manager.patron_web_domains)
+
+        # The sitewide patron web domain can have pipe separated domains, and will get spaces stripped
+        ConfigurationSetting.sitewide(
+            self._db, Configuration.PATRON_WEB_HOSTNAMES).value = "https://1.com|http://2.com |  http://subdomain.3.com|4.com"
+        self.manager.load_settings()
+        eq_(set(["https://1.com", "http://2.com",  "http://subdomain.3.com", "http://registration"]), manager.patron_web_domains)
 
         # Restore the CustomIndexView.for_library implementation
         CustomIndexView.for_library = old_for_library
@@ -653,6 +667,118 @@ class TestCirculationManager(CirculationControllerTest):
             assert isinstance(annotator, CirculationManagerAnnotator)
             eq_(worklist, annotator.lane)
 
+    def test_load_facets_from_request(self):
+        # Test our customization to the core load_facets_from_request
+        # function.
+        #
+        # Specifically, only an authenticated admin can ask to disable
+        # caching.
+        class MockAdminSignInController(object):
+            # Pretend to be able to find (or not) an Admin authenticated
+            # to make the current request.
+            admin = None
+
+            def authenticated_admin_from_request(self):
+                return self.admin
+        admin = Admin()
+        controller = MockAdminSignInController()
+
+        self.manager.admin_sign_in_controller = controller
+
+        with self.request_context_with_library("/"):
+            # If you don't specify a max cache age, nothing happens,
+            # whether or not you're an admin.
+            for value in INVALID_CREDENTIALS, admin:
+                controller.admin = value
+                facets = self.manager.load_facets_from_request()
+                eq_(None, facets.max_cache_age)
+
+        with self.request_context_with_library("/?max_age=0"):
+            # Not an admin, max cache age requested.
+            controller.admin = INVALID_CREDENTIALS
+            facets = self.manager.load_facets_from_request()
+            eq_(None, facets.max_cache_age)
+
+            # Admin, max age requested. This is the only case where
+            # nonstandard caching rules make it through
+            # load_facets_from_request().
+            controller.admin = admin
+            facets = self.manager.load_facets_from_request()
+            eq_(CachedFeed.IGNORE_CACHE, facets.max_cache_age)
+
+        # Since the admin sign-in controller is part of the admin
+        # package and not the API proper, test a situation where, for
+        # whatever reason, that controller was never initialized.
+        del self.manager.admin_sign_in_controller
+
+        # Now what controller.admin says doesn't matter, because the
+        # controller's not associated with the CirculationManager.
+        # But everything still basically works; you just can't
+        # disable the cache.
+        with self.request_context_with_library("/?max_age=0"):
+            for value in (INVALID_CREDENTIALS, admin):
+                controller.admin = value
+                facets = self.manager.load_facets_from_request()
+                eq_(None, facets.max_cache_age)
+
+    def test_cdn_url_for(self):
+        # Test the various rules for generating a URL for a view while
+        # passing it through a CDN (or not).
+
+        # The CDN configuration itself is handled inside the
+        # cdn_url_for function imported from core.app_server. So
+        # mainly we just need to check when a CirculationManager calls
+        # that function (via self._cdn_url_for), versus when it
+        # decides to bail on the CDN and call self.url_for instead.
+        class Mock(CirculationManager):
+            _cdn_url_for_calls = []
+            url_for_calls = []
+
+            def _cdn_url_for(self, view, *args, **kwargs):
+                self._cdn_url_for_calls.append((view, args, kwargs))
+                return "http://cdn/"
+
+            def url_for(self, view, *args, **kwargs):
+                self.url_for_calls.append((view, args, kwargs))
+                return "http://url/"
+
+        manager = Mock(self._db, testing=True)
+
+        # Normally, cdn_url_for calls _cdn_url_for to generate a URL.
+        args = ("arg1", "arg2")
+        kwargs = dict(key="value")
+        url = manager.cdn_url_for("view", *args, **kwargs)
+        eq_("http://cdn/", url)
+        eq_(("view", args, kwargs), manager._cdn_url_for_calls.pop())
+        eq_([], manager._cdn_url_for_calls)
+
+        # But if a faceting object is passed in as _facets, it's checked
+        # to see if it wants to disable caching.
+        class MockFacets(BaseFacets):
+            max_cache_age = None
+        kwargs_with_facets = dict(kwargs)
+        kwargs_with_facets.update(_facets=MockFacets)
+        url = manager.cdn_url_for("view", *args, **kwargs_with_facets)
+
+        # Here, the faceting object has no opinion on the matter, so
+        # _cdn_url_for is called again.
+        eq_("http://cdn/", url)
+        eq_(("view", args, kwargs), manager._cdn_url_for_calls.pop())
+        eq_([], manager._cdn_url_for_calls)
+
+        # Here, the faceting object does have an opinion: the document
+        # being generated should not be stored in a cache. This
+        # implies that the documents it links to should _also_ not be
+        # stored in a cache.
+        MockFacets.max_cache_age = CachedFeed.IGNORE_CACHE
+        url = manager.cdn_url_for("view", *args, **kwargs_with_facets)
+
+        # And so, url_for is called instead of _cdn_url_for.
+        eq_("http://url/", url)
+        eq_([], manager._cdn_url_for_calls)
+        eq_(("view", args, kwargs), manager.url_for_calls.pop())
+        eq_([], manager.url_for_calls)
+
 
 class TestBaseController(CirculationControllerTest):
 
@@ -717,6 +843,82 @@ class TestBaseController(CirculationControllerTest):
         with self.request_context_with_library("/", headers={"X-Requested-With": "XMLHttpRequest"}):
             response = self.controller.authenticate()
             eq_(None, response.headers.get("WWW-Authenticate"))
+
+    def test_handle_conditional_request(self):
+
+        # First, test success: the client provides If-Modified-Since
+        # and it is _not_ earlier than the 'last modified' date known by
+        # the server.
+
+        # We need to do a lot of Python manipulation get the
+        # current time UTC as an int, an HTTP-compatible string, and a
+        # datetime.
+        #
+        # TODO: This can be cleaned up significantly in Python 3.
+        now_int = calendar.timegm(time.gmtime())
+        now_string = email.utils.formatdate(now_int)
+        now_datetime = datetime.datetime.utcfromtimestamp(now_int)
+
+        # To make the test more realistic, set the microseconds value of 'now'.
+        now_datetime = now_datetime.replace(microsecond=random.randint(0, 999999))
+
+        # If all of that was correct, we ended up with a datetime
+        # that's very close to the one we can get with
+        # datetime.datetime.utcnow(). If it's off (due to a
+        # localtime/GMT confusion) it'll be significantly off.
+        cross_check = datetime.datetime.utcnow()
+        assert abs(now_datetime - cross_check).total_seconds() < 5
+
+        with self.app.test_request_context(
+            headers={"If-Modified-Since": now_string}
+        ):
+            response = self.controller.handle_conditional_request(now_datetime)
+            eq_(304, response.status_code)
+
+        # Try with a few specific values that comply to a greater or lesser
+        # extent with the date-format spec.
+        very_old = datetime.datetime(2000, 1, 1)
+        for value in [
+                "Thu, 01 Aug 2019 10:00:40 -0000",
+                "Thu, 01 Aug 2019 10:00:40",
+                "01 Aug 2019 10:00:40",
+        ]:
+            with self.app.test_request_context(
+                    headers={"If-Modified-Since": value}
+            ):
+                response = self.controller.handle_conditional_request(very_old)
+                eq_(304, response.status_code)
+
+        # All remaining test cases are failures: for whatever reason,
+        # the request is not a valid conditional request and the
+        # method returns None.
+
+        with self.app.test_request_context(
+            headers={"If-Modified-Since": now_string}
+        ):
+            # This request _would_ be a conditional request, but the
+            # precondition fails: If-Modified-Since is earlier than
+            # the 'last modified' date known by the server.
+            newer = now_datetime + datetime.timedelta(seconds=10)
+            response = self.controller.handle_conditional_request(newer)
+            eq_(None, response)
+
+            # Here, the server doesn't know what the 'last modified' date is,
+            # so it can't evaluate the precondition.
+            response = self.controller.handle_conditional_request(None)
+            eq_(None, response)
+
+        # Here, the precondition string is not parseable as a datetime.
+        with self.app.test_request_context(
+            headers={"If-Modified-Since": "01 Aug 2019"}
+        ):
+            response = self.controller.handle_conditional_request(very_old)
+            eq_(None, response)
+
+        # Here, the client doesn't provide a precondition at all.
+        with self.app.test_request_context():
+            response = self.controller.handle_conditional_request(very_old)
+            eq_(None, response)
 
     def test_load_licensepools(self):
 
@@ -860,6 +1062,45 @@ class TestBaseController(CirculationControllerTest):
         )
         eq_(BAD_DELIVERY_MECHANISM.uri, problem_detail.uri)
 
+    def test_apply_borrowing_policy_succeeds_for_unlimited_access_books(self):
+        with self.request_context_with_library("/"):
+            # Arrange
+            patron = self.controller.authenticated_patron(self.valid_credentials)
+            work = self._work(
+                with_license_pool=True,
+                with_open_access_download=False
+            )
+            [pool] = work.license_pools
+            pool.open_access = False
+            pool.self_hosted = False
+            pool.unlimited_access = True
+
+            # Act
+            problem = self.controller.apply_borrowing_policy(patron, pool)
+
+            # Assert
+            assert problem is None
+
+    def test_apply_borrowing_policy_succeeds_for_self_hosted_books(self):
+        with self.request_context_with_library("/"):
+            # Arrange
+            patron = self.controller.authenticated_patron(self.valid_credentials)
+            work = self._work(
+                with_license_pool=True,
+                with_open_access_download=False
+            )
+            [pool] = work.license_pools
+            pool.licenses_available = 0
+            pool.licenses_owned = 0
+            pool.open_access = False
+            pool.self_hosted = True
+
+            # Act
+            problem = self.controller.apply_borrowing_policy(patron, pool)
+
+            # Assert
+            assert problem is None
+
     def test_apply_borrowing_policy_when_holds_prohibited(self):
         with self.request_context_with_library("/"):
             patron = self.controller.authenticated_patron(self.valid_credentials)
@@ -940,9 +1181,9 @@ class TestBaseController(CirculationControllerTest):
         self._default_library.short_name = new_name
         self._db.commit()
 
-        # Bypass the 1-second timeout and make sure the site knows
+        # Bypass the 1-second cooldown and make sure the site knows
         # the configuration has actually changed.
-        model.site_configuration_has_changed(self._db, timeout=0)
+        model.site_configuration_has_changed(self._db, cooldown=0)
 
         # Just making the change and calling
         # site_configuration_has_changed was not enough to update the
@@ -1153,7 +1394,6 @@ class TestIndexController(CirculationControllerTest):
         key = data.get('public_key')
         eq_('RSA', key['type'])
         assert 'BEGIN PUBLIC KEY' in key['value']
-
 
 class TestMultipleLibraries(CirculationControllerTest):
 
@@ -1574,6 +1814,24 @@ class TestLoanController(CirculationControllerTest):
             hold = get_one(self._db, Hold, license_pool=pool)
             assert hold != None
 
+    def test_borrow_nolicenses(self):
+        edition, pool = self._edition(
+            with_open_access_download=False,
+            data_source_name=DataSource.GUTENBERG,
+            identifier_type=Identifier.GUTENBERG_ID,
+            with_license_pool=True,
+        )
+
+        with self.request_context_with_library(
+                "/", headers=dict(Authorization=self.valid_auth)):
+            self.manager.loans.authenticated_patron_from_request()
+            self.manager.d_circulation.queue_checkout(pool, NoLicenses())
+
+            response = self.manager.loans.borrow(
+                pool.identifier.type, pool.identifier.identifier)
+            eq_(404, response.status_code)
+            eq_(NOT_FOUND_ON_REMOTE, response)
+
     def test_borrow_creates_local_hold_if_remote_hold_exists(self):
         """We try to check out a book, but turns out we already have it
         on hold.
@@ -1666,6 +1924,7 @@ class TestLoanController(CirculationControllerTest):
 
         controller = self.manager.loans
         mock = MockCirculationAPI()
+        library_short_name = self._default_library.short_name
         controller.manager.circulation_apis[self._default_library.id] = mock
 
         with self.request_context_with_library(
@@ -1695,10 +1954,56 @@ class TestLoanController(CirculationControllerTest):
             # and make sure it gives the result we expect.
             expect = url_for(
                 "fulfill", license_pool_id=self.pool.id,
-                mechanism_id=mechanism.delivery_mechanism.id, part=part,
-                _external=True
+                mechanism_id=mechanism.delivery_mechanism.id,
+                library_short_name=library_short_name,
+                part=part, _external=True
             )
-            eq_(expect, fulfill_part_url(part))
+            part_url = fulfill_part_url(part)
+            eq_(expect, part_url)
+
+            # Ensure that the library short name is the first segment
+            # of the path of the fulfillment url. We cannot perform
+            # patron authentication without it.
+            expected_path = urlparse.urlparse(expect).path
+            part_url_path = urlparse.urlparse(part_url).path
+            assert expected_path.startswith("/{}/".format(library_short_name))
+            assert part_url_path.startswith("/{}/".format(library_short_name))
+
+    def test_fulfill_returns_fulfillment_info_implementing_as_response(self):
+        # If CirculationAPI.fulfill returns a FulfillmentInfo that
+        # defines as_response, the result of as_response is returned
+        # directly and the normal process of converting a FulfillmentInfo
+        # to a Flask response is skipped.
+        class MockFulfillmentInfo(FulfillmentInfo):
+            @property
+            def as_response(self):
+                return "Here's your response"
+
+        class MockCirculationAPI(object):
+            def fulfill(slf, *args, **kwargs):
+                return MockFulfillmentInfo(
+                    self._default_collection, None, None, None, None,
+                    None, None, None
+                )
+
+        controller = self.manager.loans
+        mock = MockCirculationAPI()
+        controller.manager.circulation_apis[self._default_library.id] = mock
+
+        with self.request_context_with_library(
+            "/", headers=dict(Authorization=self.valid_auth)
+        ):
+            authenticated = controller.authenticated_patron_from_request()
+            loan, ignore = self.pool.loan_to(authenticated)
+
+            # Fulfill the loan.
+            result = controller.fulfill(
+                self.pool.id, self.mech2.delivery_mechanism.id
+            )
+
+            # The result of MockFulfillmentInfo.as_response was
+            # returned directly.
+            eq_("Here's your response", result)
 
     def test_fulfill_without_active_loan(self):
 
@@ -1721,7 +2026,7 @@ class TestLoanController(CirculationControllerTest):
             response = controller.fulfill(
                 self.pool.id, self.mech2.delivery_mechanism.id
             )
-            assert isinstance(response, Response)
+            assert isinstance(response, FlaskResponse)
             eq_(401, response.status_code)
 
         # ...or it might be because of an error communicating
@@ -1889,13 +2194,71 @@ class TestLoanController(CirculationControllerTest):
             eq_("Cannot release a hold once it enters reserved state.", response.detail)
 
     def test_active_loans(self):
+
+        # First, verify that this controller supports conditional HTTP
+        # GET by calling handle_conditional_request and propagating
+        # any Response it returns.
+        response_304 = Response(status=304)
+        def handle_conditional_request(last_modified=None):
+            return response_304
+        original_handle_conditional_request = self.controller.handle_conditional_request
+        self.manager.loans.handle_conditional_request = handle_conditional_request
+
+        # Before making any requests, set the patron's last_loan_activity_sync
+        # to a known value.
+        patron = None
+        with self.request_context_with_library("/"):
+            patron = self.controller.authenticated_patron(
+                self.valid_credentials
+            )
+        now = datetime.datetime.utcnow()
+        patron.last_loan_activity_sync = now
+
+        # Make a request -- it doesn't have If-Modified-Since, but our
+        # mocked handle_conditional_request will treat it as a
+        # successful conditional request.
         with self.request_context_with_library(
-                "/", headers=dict(Authorization=self.valid_auth)):
+            "/", headers=dict(Authorization=self.valid_auth)
+        ):
+            patron = self.manager.loans.authenticated_patron_from_request()
+            response = self.manager.loans.sync()
+            assert response is response_304
+
+        # Since the conditional request succeeded, we did not call out
+        # to the vendor APIs, and patron.last_loan_activity_sync was
+        # not updated.
+        eq_(now, patron.last_loan_activity_sync)
+
+        # Leaving patron.last_loan_activity_sync alone will stop the
+        # circulation manager from calling out to the external APIs,
+        # since it was set to a recent time. We test this explicitly
+        # later, but for now, clear it out.
+        patron.last_loan_activity_sync = None
+
+        # Un-mock handle_conditional_request. It will be called over
+        # the course of this test, but it will not notice any more
+        # conditional requests -- the detailed behavior of
+        # handle_conditional_request is tested elsewhere.
+        self.manager.loans.handle_conditional_request = (
+            original_handle_conditional_request
+        )
+
+        # If the request is not conditional, an OPDS feed is returned.
+        # This feed is empty because the patron has no loans.
+        with self.request_context_with_library(
+            "/", headers=dict(Authorization=self.valid_auth)
+        ):
             patron = self.manager.loans.authenticated_patron_from_request()
             response = self.manager.loans.sync()
             assert not "<entry>" in response.data
             assert response.headers['Cache-Control'].startswith('private,')
 
+            # patron.last_loan_activity_sync was set to the moment the
+            # LoanController started calling out to the remote APIs.
+            new_sync_time = patron.last_loan_activity_sync
+            assert new_sync_time > now
+
+        # Set up a bunch of loans on the remote APIs.
         overdrive_edition, overdrive_pool = self._edition(
             with_open_access_download=False,
             data_source_name=DataSource.OVERDRIVE,
@@ -1935,11 +2298,33 @@ class TestLoanController(CirculationControllerTest):
             0,
         )
 
+        # Making a new request so soon after the last one means the
+        # circulation manager won't actually call out to the vendor
+        # APIs. The resulting feed won't reflect what we know to be
+        # the reality.
+        with self.request_context_with_library(
+                "/", headers=dict(Authorization=self.valid_auth)):
+            patron = self.manager.loans.authenticated_patron_from_request()
+            response = self.manager.loans.sync()
+            assert '<entry>' not in response.data
+
+        # patron.last_loan_activity_sync was not changed as the result
+        # of this request, since we didn't go to the vendor APIs.
+        eq_(patron.last_loan_activity_sync, new_sync_time)
+
+        # Change it now, to a timestamp far in the past.
+        long_ago = datetime.datetime(2000, 1, 1)
+        patron.last_loan_activity_sync = long_ago
+
+        # This ensures that when we request the loans feed again, the
+        # LoanController actually goes out to the vendor APIs for new
+        # information.
         with self.request_context_with_library(
                 "/", headers=dict(Authorization=self.valid_auth)):
             patron = self.manager.loans.authenticated_patron_from_request()
             response = self.manager.loans.sync()
 
+            # This time, the feed contains entries.
             feed = feedparser.parse(response.data)
             entries = feed['entries']
 
@@ -1961,6 +2346,9 @@ class TestLoanController(CirculationControllerTest):
             assert urllib.quote("%s/%s/borrow" % (bibliotheca_pool.identifier.type, bibliotheca_pool.identifier.identifier)) in borrow_link
             eq_(0, len(bibliotheca_revoke_links))
 
+            # Since we went out the the vendor APIs,
+            # patron.last_loan_activity_sync was updated.
+            assert patron.last_loan_activity_sync > new_sync_time
 
 class TestAnnotationController(CirculationControllerTest):
     def setup(self):
@@ -2313,7 +2701,7 @@ class TestWorkController(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 self.called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         # Test a basic request with custom faceting, pagination, and a
         # language and audience restriction. This will exercise nearly
@@ -2328,10 +2716,9 @@ class TestWorkController(CirculationControllerTest):
         ):
             response = m(contributor, languages, audiences, feed_class=Mock)
 
-        # We got a 200 response, where the data returned by the mock
-        # method is served as an OPDS feed.
+        # The Response served by Mock.page becomes the response to the
+        # incoming request.
         eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
         eq_("An OPDS feed", response.data)
 
         # Now check all the keyword arguments that were passed into
@@ -2340,7 +2727,6 @@ class TestWorkController(CirculationControllerTest):
 
         eq_(self._db, kwargs.pop('_db'))
         eq_(self.manager._external_search, kwargs.pop('search_engine'))
-        eq_(CachedFeed.CONTRIBUTOR_TYPE, kwargs.pop('cache_type'))
 
         # The feed is named after the contributor the request asked
         # about.
@@ -2358,7 +2744,7 @@ class TestWorkController(CirculationControllerTest):
         eq_(sort_key, pagination.last_item_on_previous_page)
         eq_(100, pagination.size)
 
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, ContributorLane)
         assert isinstance(lane.contributor, ContributorData)
 
@@ -2399,11 +2785,10 @@ class TestWorkController(CirculationControllerTest):
         with self.request_context_with_library("/"):
             response = self.manager.work_controller.permalink(self.identifier.type, self.identifier.identifier)
             annotator = LibraryAnnotator(None, None, self._default_library)
-            expect = etree.tostring(
-                AcquisitionFeed.single_entry(
-                    self._db, self.english_1, annotator
-                )
-            )
+            expect = AcquisitionFeed.single_entry(
+                self._db, self.english_1, annotator
+            ).data
+
         eq_(200, response.status_code)
         eq_(expect, response.data)
         eq_(OPDSFeed.ENTRY_TYPE, response.headers['Content-Type'])
@@ -2472,7 +2857,7 @@ class TestWorkController(CirculationControllerTest):
         # ExternalSearchIndex.
         eq_(200, response.status_code)
         feed = feedparser.parse(response.data)
-        eq_('Recommended Books', feed['feed']['title'])
+        eq_('Titles recommended by NoveList', feed['feed']['title'])
         [entry] = feed.entries
         eq_(self.english_1.title, entry['title'])
         author = self.edition.author_contributors[0]
@@ -2485,6 +2870,7 @@ class TestWorkController(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 cls.called_with = kwargs
+                return Response("A bunch of titles")
 
         kwargs['feed_class'] = Mock
         with self.request_context_with_library(
@@ -2494,14 +2880,18 @@ class TestWorkController(CirculationControllerTest):
                 *args, **kwargs
             )
 
+        # The return value of Mock.page was used as the response
+        # to the incoming request.
+        eq_(200, response.status_code)
+        eq_("A bunch of titles", response.data)
+
         kwargs = Mock.called_with
         eq_(self._db, kwargs.pop('_db'))
-        eq_('Recommended Books', kwargs.pop('title'))
-        eq_(RecommendationLane.CACHED_FEED_TYPE, kwargs.pop('cache_type'))
+        eq_('Titles recommended by NoveList', kwargs.pop('title'))
 
         # The RecommendationLane is set up to ask for recommendations
         # for this book.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, RecommendationLane)
         library = self._default_library
         eq_(library.id, lane.library_id)
@@ -2652,7 +3042,7 @@ class TestWorkController(CirculationControllerTest):
 
         # Here's the sublane for recommendations from NoveList.
         [recommended_href, recommended_entry] = by_collection_link[
-            'Recommendations for Quite British by John Bull'
+            'Similar titles recommended by NoveList'
         ]
         eq_("Same author and series", recommended_entry['title'])
         work_url = "/works/%s/%s/" % (identifier.type, identifier.identifier)
@@ -2665,7 +3055,7 @@ class TestWorkController(CirculationControllerTest):
             @classmethod
             def groups(cls, **kwargs):
                 cls.called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         mock_api.setup(metadata)
         with self.request_context_with_library('/?entrypoint=Audio'):
@@ -2674,8 +3064,9 @@ class TestWorkController(CirculationControllerTest):
                 novelist_api=mock_api, feed_class=Mock
             )
 
+        # The return value of Mock.groups was used as the response
+        # to the incoming request.
         eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
         eq_("An OPDS feed", response.data)
 
         # Verify that groups() was called with the arguments we expect.
@@ -2683,7 +3074,6 @@ class TestWorkController(CirculationControllerTest):
         eq_(self._db, kwargs.pop('_db'))
         eq_(self.manager.external_search, kwargs.pop('search_engine'))
         eq_("Related Books", kwargs.pop('title'))
-        eq_(CachedFeed.RELATED_TYPE, kwargs.pop('cache_type'))
 
         # We're passing in a FeaturedFacets. Each lane will have a chance
         # to adapt it to a faceting object appropriate for that lane.
@@ -2693,7 +3083,7 @@ class TestWorkController(CirculationControllerTest):
 
         # We're generating a grouped feed using a RelatedBooksLane
         # that has three sublanes.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, RelatedBooksLane)
         contributor_lane, novelist_lane, series_lane = lane.children
 
@@ -2844,7 +3234,7 @@ class TestWorkController(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 self.called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         # Test a basic request with custom faceting, pagination, and a
         # language and audience restriction. This will exercise nearly
@@ -2858,22 +3248,20 @@ class TestWorkController(CirculationControllerTest):
                 feed_class=Mock
             )
 
-        # We got a 200 response, where the data returned by the mock
-        # method is served as an OPDS feed.
+        # The return value of Mock.page() is the response to the
+        # incoming request.
         eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
         eq_("An OPDS feed", response.data)
 
         kwargs = self.called_with
         eq_(self._db, kwargs.pop('_db'))
-        eq_(CachedFeed.SERIES_TYPE, kwargs.pop('cache_type'))
 
         # The feed is titled after the series.
         eq_(series_name, kwargs.pop('title'))
 
         # A SeriesLane was created to ask the search index for
         # matching works.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, SeriesLane)
         eq_(self._default_library.id, lane.library_id)
         eq_(series_name, lane.series)
@@ -2925,7 +3313,12 @@ class TestWorkController(CirculationControllerTest):
         eq_("series", facets.order)
 
 
-class TestFeedController(CirculationControllerTest):
+class TestOPDSFeedController(CirculationControllerTest):
+    """Test most of the methods of OPDSFeedController.
+
+    Methods relating to crawlable feeds are tested in
+    TestCrawlableFeed.
+    """
 
     BOOKS = list(CirculationControllerTest.BOOKS) + [
         ["english_2", "Totally American", "Uncle Sam", "eng", False],
@@ -2981,7 +3374,7 @@ class TestFeedController(CirculationControllerTest):
                            ]:
             ConfigurationSetting.for_library(rel, library).value = value
 
-        # Make a real OPDS feed and poke at it. 
+        # Make a real OPDS feed and poke at it.
         with self.request_context_with_library(
             "/?entrypoint=Book&size=10"
         ):
@@ -2995,6 +3388,12 @@ class TestFeedController(CirculationControllerTest):
             # So we'll need to do a more detailed test to make sure
             # the right arguments are being passed _into_ the search
             # index.
+
+            eq_(200, response.status_code)
+            assert (
+                'max-age=%d' % Lane.MAX_CACHE_AGE
+                in response.headers['Cache-Control']
+            )
             feed = feedparser.parse(response.data)
             eq_(set([x.title for x in self.works]),
                 set([x['title'] for x in feed['entries']]))
@@ -3047,7 +3446,7 @@ class TestFeedController(CirculationControllerTest):
             assert all(lane_str in x for x in facet_links)
             assert all('entrypoint=Book' in x for x in facet_links)
             assert any('order=title' in x for x in facet_links)
-            assert any('order=author' in x for x in facet_links)       
+            assert any('order=author' in x for x in facet_links)
 
         # Now let's take a closer look at what this controller method
         # passes into AcquisitionFeed.page(), by mocking page().
@@ -3055,7 +3454,7 @@ class TestFeedController(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 self.called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         sort_key = ["sort", "pagination", "key"]
         with self.request_context_with_library(
@@ -3072,12 +3471,10 @@ class TestFeedController(CirculationControllerTest):
             expect_url = self.controller.cdn_url_for(
                 "feed", lane_identifier=lane_id,
                 library_short_name=self._default_library.short_name,
+                _facets=load_facets_from_request()
             )
 
-        # We got a 200 response, where the data returned by the mock
-        # method is served as an OPDS feed.
-        eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
+        assert isinstance(response, Response)
         eq_("An OPDS feed", response.data)
 
         # Now check all the keyword arguments that were passed into
@@ -3086,7 +3483,7 @@ class TestFeedController(CirculationControllerTest):
         eq_(kwargs.pop('url'), expect_url)
         eq_(self._db, kwargs.pop('_db'))
         eq_(self.english_adult_fiction.display_name, kwargs.pop('title'))
-        eq_(self.english_adult_fiction, kwargs.pop('lane'))
+        eq_(self.english_adult_fiction, kwargs.pop('worklist'))
 
         # Query string arguments were taken into account when
         # creating the Facets and Pagination objects.
@@ -3116,8 +3513,8 @@ class TestFeedController(CirculationControllerTest):
     def test_groups(self):
         # AcquisitionFeed.groups is tested in core/test_opds.py, and a
         # full end-to-end test would require setting up a real search
-        # index, so we're just going to test that groups() is called
-        # properly.
+        # index, so we're just going to test that groups() (or, in one
+        # case, page()) is called properly.
         library = self._default_library
         library.setting(library.MINIMUM_FEATURED_QUALITY).value = 0.15
         library.setting(library.FEATURED_LANE_SIZE).value = 2
@@ -3144,8 +3541,19 @@ class TestFeedController(CirculationControllerTest):
         class Mock(object):
             @classmethod
             def groups(cls, **kwargs):
-                self.called_with = kwargs
-                return "An OPDS feed"
+                # This method ends up being called most of the time
+                # the grouped feed controller is activated.
+                self.groups_called_with = kwargs
+                self.page_called_with = None
+                return Response("A grouped feed")
+
+            @classmethod
+            def page(cls, **kwargs):
+                # But for lanes that have no children, this method
+                # ends up being called instead.
+                self.groups_called_with = None
+                self.page_called_with = kwargs
+                return Response("A paginated feed")
 
         with self.request_context_with_library("/?entrypoint=Audio"):
             # In default_config, there are no LARGE_COLLECTION_LANGUAGES,
@@ -3160,22 +3568,22 @@ class TestFeedController(CirculationControllerTest):
             # Ask for that feed.
             response = self.manager.opds_feeds.groups(None, feed_class=Mock)
 
-            # The response is served as an OPDS feed.
+            # The Response returned by Mock.groups() has been converted
+            # into a Flask response.
             eq_(200, response.status_code)
-            eq_(OPDSFeed.ACQUISITION_FEED_TYPE,
-                response.headers['content-type'])
-            eq_("An OPDS feed", response.data)
+            eq_("A grouped feed", response.data)
 
             # While we're in request context, generate the URL we
             # expect to be used for this feed.
             expect_url = self.manager.opds_feeds.cdn_url_for(
                 "acquisition_groups", lane_identifier=None,
                 library_short_name=library.short_name,
+                _facets=load_facets_from_request()
             )
 
-        kwargs = self.called_with
+        kwargs = self.groups_called_with
         eq_(self._db, kwargs.pop('_db'))
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         eq_(expect_lane, lane)
         eq_(lane.display_name, kwargs.pop('title'))
         eq_(expect_url, kwargs.pop('url'))
@@ -3195,11 +3603,49 @@ class TestFeedController(CirculationControllerTest):
 
         # Finally, let's try again with a specific lane rather than
         # None.
+
+        # This lane has no sublanes, so our call to groups()
+        # is going to become a call to page().
         with self.request_context_with_library("/?entrypoint=Audio"):
             response = self.manager.opds_feeds.groups(
                 self.english_adult_fiction.id, feed_class=Mock
             )
-        eq_(self.english_adult_fiction, self.called_with.pop('lane'))
+
+            # While we're in request context, generate the URL we
+            # expect to be used for this feed.
+            expect_url = self.manager.opds_feeds.cdn_url_for(
+                "feed", lane_identifier=self.english_adult_fiction.id,
+                library_short_name=library.short_name,
+                _facets=load_facets_from_request()
+            )
+
+        eq_(self.english_adult_fiction, self.page_called_with.pop('worklist'))
+
+        # The canonical URL for this feed is a page-type URL, not a
+        # groups-type URL.
+        eq_(expect_url, self.page_called_with.pop('url'))
+
+        # The faceting and pagination objects are typical for the
+        # first page of a paginated feed.
+        pagination = self.page_called_with.pop('pagination')
+        assert isinstance(pagination, SortKeyPagination)
+        facets = self.page_called_with.pop('facets')
+        assert isinstance(facets, Facets)
+
+        # groups() was never called.
+        eq_(None, self.groups_called_with)
+
+        # Give this lane a sublane, and the call to groups() goes
+        # through as normal.
+        sublane = self._lane(parent=self.english_adult_fiction)
+        with self.request_context_with_library("/?entrypoint=Audio"):
+            response = self.manager.opds_feeds.groups(
+                self.english_adult_fiction.id, feed_class=Mock
+            )
+        eq_(None, self.page_called_with)
+        eq_(self.english_adult_fiction, self.groups_called_with.pop('worklist'))
+        assert isinstance(self.groups_called_with.pop('facets'), FeaturedFacets)
+        assert 'pagination' not in self.groups_called_with
 
     def test_navigation(self):
         library = self._default_library
@@ -3224,13 +3670,11 @@ class TestFeedController(CirculationControllerTest):
             # sublanes for English, Spanish, Chinese, and French.
             eq_(len(lane.sublanes), len(entries))
 
-        # A FeaturedFacets object was created from a combination of
-        # library configuration and lane configuration, and passed in
-        # to NavigationFeed.navigation().
+        # A NavigationFacets object was created and passed in to
+        # NavigationFeed.navigation().
         args, kwargs = self.called_with
         facets = kwargs['facets']
-        assert isinstance(facets, FeaturedFacets)
-        eq_(library.minimum_featured_quality, facets.minimum_featured_quality)
+        assert isinstance(facets, NavigationFacets)
         NavigationFeed.navigation = old_navigation
 
     def _set_update_times(self):
@@ -3311,6 +3755,10 @@ class TestFeedController(CirculationControllerTest):
 
         kwargs = self.called_with
         eq_(self._db, kwargs.pop('_db'))
+
+        # Unlike other types of feeds, here the argument is called
+        # 'lane' instead of 'worklist', because a Lane is the _only_
+        # kind of WorkList that is currently searchable.
         lane = kwargs.pop('lane')
         eq_(expect_lane, lane)
         query = kwargs.pop("query")
@@ -3411,10 +3859,10 @@ class TestCrawlableFeed(CirculationControllerTest):
         """
         controller = self.manager.opds_feeds
         original = controller._crawlable_feed
-        def mock(title, url, lane, annotator=None,
+        def mock(title, url, worklist, annotator=None,
                  feed_class=AcquisitionFeed):
             self._crawlable_feed_called_with = dict(
-                title=title, url=url, lane=lane, annotator=annotator,
+                title=title, url=url, worklist=worklist, annotator=annotator,
                 feed_class=feed_class
             )
             return "An OPDS feed."
@@ -3449,7 +3897,7 @@ class TestCrawlableFeed(CirculationControllerTest):
 
         # A CrawlableCollectionBasedLane has been set up to show
         # everything in any of the requested library's collections.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, CrawlableCollectionBasedLane)
         eq_(library.id, lane.library_id)
         eq_([x.id for x in library.collections], lane.collection_ids)
@@ -3468,8 +3916,8 @@ class TestCrawlableFeed(CirculationControllerTest):
             response = controller.crawlable_collection_feed(
                 collection_name="No such collection"
             )
-            eq_(NO_SUCH_COLLECTION, response)            
-            
+            eq_(NO_SUCH_COLLECTION, response)
+
         # Unlike most of these controller methods, this one does not
         # require a library context.
         with self.app.test_request_context("/"):
@@ -3494,7 +3942,7 @@ class TestCrawlableFeed(CirculationControllerTest):
 
         # A CrawlableCollectionBasedLane has been set up to show
         # everything in the requested collection.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, CrawlableCollectionBasedLane)
         eq_(None, lane.library_id)
         eq_([collection.id], lane.collection_ids)
@@ -3517,7 +3965,7 @@ class TestCrawlableFeed(CirculationControllerTest):
         annotator = kwargs['annotator']
         assert isinstance(annotator, SharedCollectionAnnotator)
         eq_(collection, annotator.collection)
-        eq_(kwargs['lane'], annotator.lane)
+        eq_(kwargs['worklist'], annotator.lane)
 
     def test_crawlable_list_feed(self):
         # Test the creation of a crawlable feed for everything in
@@ -3561,11 +4009,11 @@ class TestCrawlableFeed(CirculationControllerTest):
 
         # A CrawlableCustomListBasedLane was created to fetch only
         # the works in the custom list.
-        lane = kwargs.pop('lane')
+        lane = kwargs.pop('worklist')
         assert isinstance(lane, CrawlableCustomListBasedLane)
         eq_([customlist.id], lane.customlist_ids)
         eq_({}, kwargs)
-            
+
     def test__crawlable_feed(self):
         # Test the helper method called by all other feed methods.
         self.page_called_with = None
@@ -3573,7 +4021,7 @@ class TestCrawlableFeed(CirculationControllerTest):
             @classmethod
             def page(cls, **kwargs):
                 self.page_called_with = kwargs
-                return "An OPDS feed"
+                return Response("An OPDS feed")
 
         work = self._work(with_open_access_download=True)
         class MockLane(DynamicLane):
@@ -3598,7 +4046,7 @@ class TestCrawlableFeed(CirculationControllerTest):
         in_kwargs = dict(
             title="Lane title",
             url="Lane URL",
-            lane=mock_lane,
+            worklist=mock_lane,
             feed_class=MockFeed
         )
 
@@ -3623,7 +4071,6 @@ class TestCrawlableFeed(CirculationControllerTest):
 
         # The result of page() was served as an OPDS feed.
         eq_(200, response.status_code)
-        eq_(OPDSFeed.ACQUISITION_FEED_TYPE, response.headers['content-type'])
         eq_("An OPDS feed", response.data)
 
         # Verify the arguments passed in to page().
@@ -3631,10 +4078,9 @@ class TestCrawlableFeed(CirculationControllerTest):
         eq_(self._db, out_kwargs.pop('_db'))
         eq_(self.manager.opds_feeds.search_engine,
             out_kwargs.pop('search_engine'))
-        eq_(in_kwargs['lane'], out_kwargs.pop('lane'))
+        eq_(in_kwargs['worklist'], out_kwargs.pop('worklist'))
         eq_(in_kwargs['title'], out_kwargs.pop('title'))
         eq_(in_kwargs['url'], out_kwargs.pop('url'))
-        eq_('crawlable', out_kwargs.pop('cache_type'))
 
         # Since no annotator was provided and the request did not
         # happen in a library context, a generic
@@ -4497,17 +4943,27 @@ class TestSharedCollectionController(ControllerTest):
             eq_(NO_ACTIVE_HOLD.uri, response.uri)
 
 
-class TestURLLookupController(ControllerTest):
+class TestURNLookupController(ControllerTest):
     """Test that a client can look up data on specific works."""
 
-    def test_get(self):
-        # Look up a work.
-        work = self._work(with_license_pool=True)
+    def test_work_lookup(self):
+        work = self._work(with_open_access_download=True)
         [pool] = work.license_pools
         urn = pool.identifier.urn
         with self.request_context_with_library("/?urn=%s" % urn):
             route_name = "work"
+
+            # Look up a work.
             response = self.manager.urn_lookup.work_lookup(route_name)
+
+            # We got an OPDS feed.
+            eq_(200, response.status_code)
+            eq_(
+                OPDSFeed.ACQUISITION_FEED_TYPE,
+                response.headers['Content-Type']
+            )
+
+            # Parse it.
             feed = feedparser.parse(response.data)
 
             # The route name we passed into work_lookup shows up in
@@ -4518,6 +4974,12 @@ class TestURLLookupController(ControllerTest):
             # The work we looked up has an OPDS entry.
             [entry] = feed['entries']
             eq_(work.title, entry['title'])
+
+            # The OPDS feed includes an open-access acquisition link
+            # -- something that only gets inserted by the
+            # CirculationManagerAnnotator.
+            [link] = entry.links
+            eq_(LinkRelations.OPEN_ACCESS_DOWNLOAD, link['rel'])
 
 
 class TestProfileController(ControllerTest):

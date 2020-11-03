@@ -1,21 +1,19 @@
-from nose.tools import set_trace
 import flask
 from flask import Response
 from flask_babel import lazy_gettext as _
 
-from . import SettingsController
+from api.admin.problem_details import *
 from core.marc import MARCExporter
 from core.model import (
     ExternalIntegration,
-    ConfigurationSetting,
-    Session,
     get_one,
     get_one_or_create
 )
 from core.model.configuration import ExternalIntegrationLink
-from api.admin.problem_details import *
+from core.s3 import S3UploaderConfiguration
 from core.util.problem_detail import ProblemDetail
-from core.s3 import S3Uploader
+from . import SettingsController
+
 
 class CatalogServicesController(SettingsController):
 
@@ -23,9 +21,10 @@ class CatalogServicesController(SettingsController):
         super(CatalogServicesController, self).__init__(manager)
         service_apis = [MARCExporter]
         self.protocols = self._get_integration_protocols(service_apis, protocol_name_attr="NAME")
-        self.protocols[0]['settings'].append(
-            MARCExporter.get_storage_settings(self._db)
-        )
+        self.update_protocol_settings()
+    
+    def update_protocol_settings(self):
+        self.protocols[0]['settings'] = [MARCExporter.get_storage_settings(self._db)]
 
     def process_catalog_services(self):
         self.require_system_admin()
@@ -37,6 +36,7 @@ class CatalogServicesController(SettingsController):
 
     def process_get(self):
         services = self._get_integration_info(ExternalIntegration.CATALOG_GOAL, self.protocols)
+        self.update_protocol_settings()
         return dict(
             catalog_services=services,
             protocols=self.protocols,
@@ -104,7 +104,7 @@ class CatalogServicesController(SettingsController):
             self._db, ExternalIntegrationLink,
             library_id=None,
             external_integration_id=service.id,
-            purpose="MARC"
+            purpose=ExternalIntegrationLink.MARC
         )
 
         if mirror_integration_id == self.NO_MIRROR_INTEGRATION:
@@ -115,7 +115,8 @@ class CatalogServicesController(SettingsController):
                 self._db, ExternalIntegration, id=mirror_integration_id
             )
             # Only get storage integrations that have a MARC file option set
-            if not storage_integration or not storage_integration.setting(S3Uploader.MARC_BUCKET_KEY).value:
+            if not storage_integration or \
+                    not storage_integration.setting(S3UploaderConfiguration.MARC_BUCKET_KEY).value:
                 return MISSING_INTEGRATION
             current_integration_link.other_integration_id=storage_integration.id
 

@@ -169,7 +169,7 @@ class TestOdiloAPI(OdiloAPITest):
         self.api.refresh_creds(credential)
         eq_("new bearer token 2", credential.credential)
         eq_(self.api.token, credential.credential)
-        assert credential.expires > datetime.datetime.now()
+        assert credential.expires > datetime.datetime.utcnow()
 
     def test_credential_refresh_failure(self):
         """Verify that a useful error message results when the Odilo bearer
@@ -799,6 +799,20 @@ class TestOdiloRepresentationExtractor(OdiloAPITest):
         eq_(1, circulation.licenses_reserved)
 
         self.api.log.info('Testing book info with metadata finished ok !!')
+
+    def test_book_info_missing_metadata(self):
+        # Verify that we properly handle missing metadata from Odilo.
+        raw, book_json = self.sample_json("odilo_metadata.json")
+
+        # This was seen in real data.
+        book_json['series'] = ' '
+        book_json['seriesPosition'] = ' '
+
+        metadata, active = OdiloRepresentationExtractor.record_info_to_metadata(
+            book_json, {}
+        )
+        eq_(None, metadata.series)
+        eq_(None, metadata.series_position)
 
     def test_default_language_spanish(self):
         """Since Odilo primarily distributes Spanish-language titles, if a
