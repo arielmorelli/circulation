@@ -335,6 +335,7 @@ class OverdriveAPI(BaseOverdriveAPI, BaseCirculationAPI, HasSelfTests):
             data=payload
         )
         data = response.json()
+        set_trace()
         if response.status_code == 400:
             return self._process_checkout_error(patron, pin, licensepool, data)
         else:
