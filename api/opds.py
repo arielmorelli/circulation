@@ -81,6 +81,14 @@ class CirculationManagerAnnotator(Annotator):
         self.hidden_content_types = hidden_content_types
         self.test_mode = test_mode
 
+    def is_work_entry_complete(self, work):
+        """Return a boolean value indicating whether the work's OPDS catalog entry is complete.
+
+        :return: Boolean value indicating whether the work's OPDS catalog entry is complete
+        :rtype: bool
+        """
+        return self.active_loans_by_work or self.active_holds_by_work or self.active_fulfillments_by_work
+
     def _lane_identifier(self, lane):
         if isinstance(lane, Lane):
             return lane.id
