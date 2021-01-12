@@ -15,6 +15,10 @@ from werkzeug.exceptions import HTTPException
 
 from app import app, babel
 
+# We use URIs as identifiers throughout the application, meaning that
+# we never want werkzeug's merge_slashes feature.
+app.url_map.merge_slashes = False
+
 from config import Configuration
 from core.app_server import (
     ErrorHandler,
@@ -77,6 +81,9 @@ def requires_auth(f):
 def allows_auth(f):
     """Decorator function for a controller method that supports both
     authenticated and unauthenticated requests.
+
+    NOTE: This decorator might not be necessary; you can probably call
+    BaseCirculationManagerController.request_patron instead.
     """
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -145,6 +152,34 @@ def has_library(f):
         else:
             return f(*args, **kwargs)
     return decorated
+
+def has_library_through_external_loan_identifier(parameter_name='external_loan_identifier'):
+    """Decorator to get a library using the loan's external identifier.
+
+    :param parameter_name: Name of the parameter holding the loan's external identifier
+    :type parameter_name: string
+
+    :return: Decorated function
+    :rtype: Callable
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if parameter_name in kwargs:
+                external_loan_identifier = kwargs[parameter_name]
+            else:
+                external_loan_identifier = None
+
+            library = app.manager.index_controller.library_through_external_loan_identifier(external_loan_identifier)
+
+            if isinstance(library, ProblemDetail):
+                return library.response
+            else:
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 def allows_library(f):
     """Decorator similar to @has_library but if there is no library short name,
@@ -234,6 +269,15 @@ def public_key_document():
 @compressible
 def acquisition_groups(lane_identifier):
     return app.manager.opds_feeds.groups(lane_identifier)
+
+@library_route('/feed/qa')
+@has_library
+@allows_patron_web
+@requires_auth
+@returns_problem_detail
+@compressible
+def qa_feed():
+    return app.manager.opds_feeds.qa_feed()
 
 @library_dir_route('/feed', defaults=dict(lane_identifier=None))
 @library_route('/feed/<lane_identifier>')
@@ -371,7 +415,7 @@ def annotations():
 def annotation_detail(annotation_id):
     return app.manager.annotations.detail(annotation_id)
 
-@library_route('/annotations/<identifier_type>/<path:identifier>/', methods=['GET'])
+@library_route('/annotations/<identifier_type>/<path:identifier>', methods=['GET'])
 @has_library
 @allows_patron_web
 @requires_auth
@@ -389,6 +433,11 @@ def annotations_for_work(identifier_type, identifier):
 @returns_problem_detail
 def borrow(identifier_type, identifier, mechanism_id=None):
     return app.manager.loans.borrow(identifier_type, identifier, mechanism_id)
+
+@library_route('/works/<license_pool_id>/fulfill/<mechanism_id>/<part>/rbdproxy/<bearer>')
+@has_library
+def proxy_rbdigital_patron_requests(license_pool_id, mechanism_id, part, bearer):
+    return app.manager.rbdproxy.proxy(bearer)
 
 @library_route('/works/<license_pool_id>/fulfill')
 @library_route('/works/<license_pool_id>/fulfill/<mechanism_id>')
@@ -538,6 +587,43 @@ def oauth_authenticate():
 @returns_problem_detail
 def oauth_callback():
     return app.manager.oauth_controller.oauth_authentication_callback(app.manager._db, flask.request.args)
+
+# Route that redirects to the authentication URL for a SAML provider
+@library_route('/saml_authenticate')
+@has_library
+@returns_problem_detail
+def saml_authenticate():
+    return app.manager.saml_controller.saml_authentication_redirect(flask.request.args, app.manager._db)
+
+# Redirect URI for SAML providers
+# NOTE: we cannot use @has_library decorator and append a library's name to saml_calback route
+# (e.g. https://cm.org/LIBRARY_NAME/saml_callback).
+# The URL of the SP's assertion consumer service (saml_callback) should be constant:
+# SP's metadata is registered in the IdP and cannot change.
+# If we try to append a library's name to the ACS's URL sent as a part of the SAML request,
+# the IdP will fail this request because the URL mentioned in the request and
+# the URL saved in the SP's metadata configured in this IdP will differ.
+# Library's name is passed as a part of the relay state and processed in SAMLController.saml_authentication_callback
+@returns_problem_detail
+@app.route("/saml_callback", methods=['POST'])
+def saml_callback():
+    return app.manager.saml_controller.saml_authentication_callback(request, app.manager._db)
+
+
+@app.route('/<collection_name>/lcp/licenses/<license_id>/hint')
+@has_library_through_external_loan_identifier(parameter_name='license_id')
+@requires_auth
+@returns_problem_detail
+def lcp_passphrase(collection_name, license_id):
+    return app.manager.lcp_controller.get_lcp_passphrase()
+
+
+@app.route('/<collection_name>/lcp/licenses/<license_id>')
+@has_library_through_external_loan_identifier(parameter_name='license_id')
+@requires_auth
+@returns_problem_detail
+def lcp_license(collection_name, license_id):
+    return app.manager.lcp_controller.get_lcp_license(collection_name, license_id)
 
 # Loan notifications for ODL distributors, eg. Feedbooks
 @library_route('/odl_notify/<loan_id>', methods=['GET', 'POST'])

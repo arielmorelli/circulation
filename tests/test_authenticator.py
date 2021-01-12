@@ -42,6 +42,7 @@ from core.util.authentication_for_opds import (
 from core.util.http import IntegrationException
 from core.mock_analytics_provider import MockAnalyticsProvider
 
+from api.announcements import Announcements
 from api.millenium_patron import MilleniumPatronAPI
 from api.firstbook import FirstBookAuthenticationAPI
 from api.clever import CleverAuthenticationAPI
@@ -57,6 +58,7 @@ from api.authenticator import (
     OAuthAuthenticationProvider,
     PatronData,
 )
+from api.problem_details import PATRON_OF_ANOTHER_LIBRARY
 from api.simple_authentication import SimpleAuthenticationProvider
 from api.millenium_patron import MilleniumPatronAPI
 from api.opds import LibraryAnnotator
@@ -1206,9 +1208,9 @@ class TestLibraryAuthenticator(AuthenticatorTest):
 
         # Set the colors a web client should use.
         ConfigurationSetting.for_library(
-            Configuration.WEB_BACKGROUND_COLOR, library).value = "#012345"
+            Configuration.WEB_PRIMARY_COLOR, library).value = "#012345"
         ConfigurationSetting.for_library(
-            Configuration.WEB_FOREGROUND_COLOR, library).value = "#abcdef"
+            Configuration.WEB_SECONDARY_COLOR, library).value = "#abcdef"
 
         # Configure the various ways a patron can get help.
         ConfigurationSetting.for_library(
@@ -1221,6 +1223,33 @@ class TestLibraryAuthenticator(AuthenticatorTest):
         base_url = ConfigurationSetting.sitewide(self._db, Configuration.BASE_URL_KEY)
         base_url.value = u'http://circulation-manager/'
 
+        # Configure three announcements: two active and one
+        # inactive.
+        format = '%Y-%m-%d'
+        today = datetime.date.today()
+        tomorrow = (today + datetime.timedelta(days=1)).strftime(format)
+        yesterday = (today - datetime.timedelta(days=1)).strftime(format)
+        two_days_ago = (today - datetime.timedelta(days=2)).strftime(format)
+        today = today.strftime(format)
+        announcements = [
+            dict(
+                id='a1', content='this is announcement 1',
+                start=yesterday, finish=today,
+            ),
+            dict(
+                id='a2', content='this is announcement 2',
+                start=two_days_ago, finish=yesterday,
+            ),
+            dict(
+                id='a3', content='this is announcement 3',
+                start=yesterday, finish=today,
+            ),
+        ]
+        announcement_setting = ConfigurationSetting.for_library(
+            Announcements.SETTING_NAME, library
+        )
+        announcement_setting.value = json.dumps(announcements)
+
         with self.app.test_request_context("/"):
             url = authenticator.authentication_document_url(library)
             assert url.endswith(
@@ -1229,8 +1258,8 @@ class TestLibraryAuthenticator(AuthenticatorTest):
 
             doc = json.loads(authenticator.create_authentication_document())
             # The main thing we need to test is that the
-            # sub-documents are assembled properly and placed in the
-            # right position.
+            # authentication sub-documents are assembled properly and
+            # placed in the right position.
             flows = doc['authentication']
             oauth_doc, basic_doc = sorted(flows, key=lambda x: x['type'])
 
@@ -1248,8 +1277,8 @@ class TestLibraryAuthenticator(AuthenticatorTest):
 
             # The mobile color scheme and web colors are correctly reported.
             eq_("plaid", doc['color_scheme'])
-            eq_("#012345", doc['web_color_scheme']['background'])
-            eq_("#abcdef", doc['web_color_scheme']['foreground'])
+            eq_("#012345", doc['web_color_scheme']['primary'])
+            eq_("#abcdef", doc['web_color_scheme']['secondary'])
 
             # _geographic_areas was called and provided the library's
             # focus area and service area.
@@ -1323,6 +1352,17 @@ class TestLibraryAuthenticator(AuthenticatorTest):
                 alternate
             )
 
+            # Active announcements are published; inactive announcements are not.
+            a1, a3 = doc['announcements']
+            eq_(
+                dict(id='a1', content='this is announcement 1'),
+                a1
+            )
+            eq_(
+                dict(id='a3', content='this is announcement 3'),
+                a3
+            )
+
             # Features that are enabled for this library are communicated
             # through the 'features' item.
             features = doc['features']
@@ -1344,6 +1384,12 @@ class TestLibraryAuthenticator(AuthenticatorTest):
             doc = json.loads(authenticator.create_authentication_document())
             for key in ('focus_area', 'service_area'):
                 assert key not in doc
+
+            # If there are no announcements, the list of announcements is present
+            # but empty.
+            announcement_setting.value = None
+            doc = json.loads(authenticator.create_authentication_document())
+            eq_([], doc['announcements'])
 
             # The annotator's annotate_authentication_document method
             # was called and successfully modified the authentication
@@ -1864,6 +1910,15 @@ class TestBasicAuthenticationProvider(AuthenticatorTest):
 
 
     def test_testing_patron(self):
+
+        class MockAuthenticatedPatron(MockBasicAuthenticationProvider):
+            def __init__(self, *args, **kwargs):
+                self._authenticated_patron_returns = kwargs.pop("_authenticated_patron_returns", None)
+                super(MockAuthenticatedPatron, self).__init__(*args, **kwargs)
+
+            def authenticated_patron(self, *args, **kwargs):
+                return self._authenticated_patron_returns
+
         # You don't have to have a testing patron.
         integration = self._external_integration(self._str)
         no_testing_patron = BasicAuthenticationProvider(
@@ -1901,6 +1956,54 @@ class TestBasicAuthenticationProvider(AuthenticatorTest):
             self._db
         )
 
+        # We configure a testing patron but authenticating them
+        # results in a problem detail document.
+        b = BasicAuthenticationProvider
+        patron = self._patron()
+        integration = self._external_integration(self._str)
+        integration.setting(b.TEST_IDENTIFIER).value = '1'
+        integration.setting(b.TEST_PASSWORD).value = '2'
+        problem_patron = MockAuthenticatedPatron(
+            self._default_library, integration, patron=patron,
+            _authenticated_patron_returns=PATRON_OF_ANOTHER_LIBRARY
+        )
+        value = problem_patron.testing_patron(self._db)
+        assert patron != PATRON_OF_ANOTHER_LIBRARY
+        eq_((PATRON_OF_ANOTHER_LIBRARY, "2"), value)
+
+        # And testing_patron_or_bust() still doesn't work.
+        assert_raises_regexp(
+            IntegrationException,
+            "Test patron lookup returned a problem detail",
+            problem_patron.testing_patron_or_bust,
+            self._db
+        )
+
+        # We configure a testing patron but authenticating them
+        # results in something (non None) that's not a Patron
+        # or a problem detail document.
+        not_a_patron = "<not a patron>"
+        b = BasicAuthenticationProvider
+        patron = self._patron()
+        integration = self._external_integration(self._str)
+        integration.setting(b.TEST_IDENTIFIER).value = '1'
+        integration.setting(b.TEST_PASSWORD).value = '2'
+        problem_patron = MockAuthenticatedPatron(
+            self._default_library, integration, patron=patron,
+            _authenticated_patron_returns=not_a_patron
+        )
+        value = problem_patron.testing_patron(self._db)
+        assert patron != not_a_patron
+        eq_((not_a_patron, "2"), value)
+
+        # And testing_patron_or_bust() still doesn't work.
+        assert_raises_regexp(
+            IntegrationException,
+            "Test patron lookup returned invalid value for patron",
+            problem_patron.testing_patron_or_bust,
+            self._db
+        )
+
         # Here, we configure a testing patron who is authenticated by
         # their username and password.
         patron = self._patron()
@@ -1914,6 +2017,7 @@ class TestBasicAuthenticationProvider(AuthenticatorTest):
         # Finally, testing_patron_or_bust works, returning the same
         # value as testing_patron()
         eq_(value, present_patron.testing_patron_or_bust(self._db))
+
 
     def test__run_self_tests(self):
         _db = object()

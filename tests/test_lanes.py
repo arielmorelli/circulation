@@ -8,6 +8,7 @@ from nose.tools import (
 )
 import json
 import datetime
+from mock import MagicMock
 
 from . import (
     DatabaseTest,
@@ -59,6 +60,8 @@ from api.lanes import (
     CrawlableCollectionBasedLane,
     CrawlableFacets,
     CrawlableCustomListBasedLane,
+    JackpotWorkList,
+    KnownOverviewFacetsWorkList,
     RecommendationLane,
     RelatedBooksLane,
     SeriesFacets,
@@ -389,6 +392,43 @@ class TestWorkBasedLane(DatabaseTest):
         # of children. It doesn't reuse the first lane's list.
         lane2 = WorkBasedLane(self._default_library, work)
         eq_([], lane2.children)
+
+    def test_accessible_to(self):
+        # A lane based on a Work is accessible to a patron only if
+        # the Work is age-appropriate for the patron.
+        work = self._work()
+        patron = self._patron()
+        lane = WorkBasedLane(self._default_library, work)
+
+        work.age_appropriate_for_patron = MagicMock(return_value=False)
+        eq_(False, lane.accessible_to(patron))
+        work.age_appropriate_for_patron.assert_called_once_with(patron)
+
+        # If for whatever reason Work is not set, we just we say the Lane is
+        # accessible -- but things probably won't work.
+        lane.work = None
+        eq_(True, lane.accessible_to(patron))
+
+        # age_appropriate_for_patron wasn't called, since there was no
+        # work.
+        work.age_appropriate_for_patron.assert_called_once_with(patron)
+
+        lane.work = work
+        work.age_appropriate_for_patron = MagicMock(return_value=True)
+        lane = WorkBasedLane(self._default_library, work)
+        eq_(True, lane.accessible_to(patron))
+        work.age_appropriate_for_patron.assert_called_once_with(patron)
+
+        # The WorkList rules are still enforced -- for instance, a
+        # patron from library B can't access any kind of WorkList from
+        # library A.
+        other_library_patron = self._patron(library=self._library())
+        eq_(False, lane.accessible_to(other_library_patron))
+
+        # age_appropriate_for_patron was never called with the new
+        # patron -- the WorkList rules answered the question before we
+        # got to that point.
+        work.age_appropriate_for_patron.assert_called_once_with(patron)
 
 
 class TestRelatedBooksLane(DatabaseTest):
@@ -871,3 +911,105 @@ class TestCrawlableCustomListBasedLane(DatabaseTest):
         eq_(customlist.name, kwargs.get("list_name"))
 
 
+class TestKnownOverviewFacetsWorkList(DatabaseTest):
+    """Test of the KnownOverviewFacetsWorkList class.
+
+    This is an unusual class which should be used when hard-coding the
+    faceting object to use for a given WorkList when generating a
+    grouped feed.
+    """
+    def test_overview_facets(self):
+        # Show that we can hard-code the return value of overview_facets.
+        #
+        # core/tests/test_lanes.py#TestWorkList.test_groups_propagates_facets
+        # verifies that WorkList.groups() calls
+        # WorkList.overview_facets() and passes the return value
+        # (which we hard-code here) into WorkList.works().
+
+        # Pass in a known faceting object.
+        known_facets = object()
+        wl = KnownOverviewFacetsWorkList(known_facets)
+
+        # That faceting object is always returned when we're
+        # making a grouped feed.
+        some_other_facets = object()
+        eq_(known_facets, wl.overview_facets(self._db, some_other_facets))
+
+
+class TestJackpotWorkList(DatabaseTest):
+    """Test the 'jackpot' WorkList that always contains the information
+    necessary to run a full suite of integration tests.
+    """
+
+    def test_constructor(self):
+        # Add some stuff to the default library to make sure we
+        # test everything.
+
+        # The default library comes with a collection whose data
+        # source is unspecified. Make another one whose data source _is_
+        # specified.
+        overdrive_collection = self._collection(
+            "Test Overdrive Collection", protocol=ExternalIntegration.OVERDRIVE,
+            data_source_name=DataSource.OVERDRIVE
+        )
+        self._default_library.collections.append(overdrive_collection)
+
+        # Create another collection that is _not_ associated with this
+        # library. It will not be used at all.
+        ignored_collection = self._collection(
+            "Ignored Collection", protocol=ExternalIntegration.BIBLIOTHECA,
+            data_source_name=DataSource.BIBLIOTHECA
+        )
+
+        # The JackpotWorkList has no works of its own -- only its children
+        # have works.
+        wl = JackpotWorkList(self._default_library)
+        eq_([], wl.works(self._db))
+
+        # Let's take a look at the children.
+
+        # NOTE: This test is structured to make it easy to add other
+        # groups of children later on.
+        children = list(wl.children)
+        available_now = children[:4]
+        children = children[4:]
+
+        # This group contains four similar
+        # KnownOverviewFacetsWorkLists. They only show works that are
+        # currently available.
+        for i in available_now:
+            assert isinstance(i, KnownOverviewFacetsWorkList)
+            facets = i.facets
+            eq_(self._default_library, facets.library)
+            eq_(Facets.AVAILABLE_NOW, facets.availability)
+
+        # These worklists show ebooks and audiobooks from the two
+        # collections associated with the default library.
+        [default_ebooks, default_audio, overdrive_ebooks, overdrive_audio] = (
+            available_now
+        )
+
+        eq_("[Collection test] - License source {[Unknown]} - Medium {Book} - Availability {now} - Collection name {%s}" % self._default_collection.name, 
+            default_ebooks.display_name)
+        eq_([self._default_collection.id], default_ebooks.collection_ids)
+        eq_([Edition.BOOK_MEDIUM], default_ebooks.media)
+
+        eq_("[Collection test] - License source {[Unknown]} - Medium {Audio} - Availability {now} - Collection name {%s}" % self._default_collection.name,
+            default_audio.display_name)
+        eq_([self._default_collection.id], default_audio.collection_ids)
+        eq_([Edition.AUDIO_MEDIUM], default_audio.media)
+
+        eq_("[Collection test] - License source {Overdrive} - Medium {Book} - Availability {now} - Collection name {Test Overdrive Collection}",
+            overdrive_ebooks.display_name)
+        eq_([overdrive_collection.id], overdrive_ebooks.collection_ids)
+        eq_([Edition.BOOK_MEDIUM], overdrive_ebooks.media)
+
+
+        eq_("[Collection test] - License source {Overdrive} - Medium {Audio} - Availability {now} - Collection name {Test Overdrive Collection}",
+            overdrive_audio.display_name)
+        eq_([overdrive_collection.id], overdrive_audio.collection_ids)
+        eq_([Edition.AUDIO_MEDIUM], overdrive_audio.media)
+
+        # At this point we've looked at all the children of the
+        # JackpotWorkList
+        eq_([], children)

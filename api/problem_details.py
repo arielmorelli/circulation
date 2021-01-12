@@ -188,6 +188,11 @@ FORBIDDEN_BY_POLICY = pd(
       _("Library policy prevents us from carrying out your request."),
 )
 
+NOT_AGE_APPROPRIATE = FORBIDDEN_BY_POLICY.detailed(
+    _("Library policy considers this title inappropriate for your patron type."),
+    status_code=451
+)
+
 CANNOT_FULFILL = pd(
       "http://librarysimplified.org/terms/problem/cannot-fulfill-loan",
       400,
@@ -235,6 +240,20 @@ INVALID_OAUTH_BEARER_TOKEN = pd(
     status_code=400,
     title=_("Invalid OAuth bearer token."),
     detail=_("The provided OAuth bearer token couldn't be verified."),
+)
+
+UNKNOWN_SAML_PROVIDER = pd(
+    "http://librarysimplified.org/terms/problem/unknown-saml-provider",
+    status_code=400,
+    title=_("Unknown SAML provider."),
+    detail=_("The specified SAML provider name isn't one of the known providers."),
+)
+
+INVALID_SAML_BEARER_TOKEN = pd(
+    "http://librarysimplified.org/terms/problem/credentials-invalid",
+    status_code=400,
+    title=_("Invalid SAML bearer token."),
+    detail=_("The provided SAML bearer token couldn't be verified."),
 )
 
 UNSUPPORTED_AUTHENTICATION_MECHANISM = pd(
