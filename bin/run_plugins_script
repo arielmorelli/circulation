@@ -9,6 +9,9 @@ sys.path.append(os.path.abspath(package_dir))
 from api.plugins import get_installed_plugins
 
 plugins = get_installed_plugins()
-for plugin in plugins:
-    plugin.run_scripts()
+for plugin in plugins.values():
+    try:
+        plugin.run_scripts()
+    except Exception as ex:
+        print(ex)
 

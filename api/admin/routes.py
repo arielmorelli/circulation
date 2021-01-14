@@ -662,3 +662,10 @@ def admin_js():
 def admin_css():
     directory = os.path.join(os.path.abspath(os.path.dirname(__file__)), "node_modules", "simplified-circulation-web", "dist")
     return app.manager.static_files.static_file(directory, "circulation-web.css")
+
+@app.route("/admin/plugins", methods=['GET'])
+@returns_json_or_response_or_problem_detail
+@requires_admin
+@requires_csrf_token
+def list_plugins():
+    return flask.jsonify(app.plugins.keys())

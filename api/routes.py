@@ -14,6 +14,7 @@ from flask_cors.core import get_cors_options, set_cors_headers
 from werkzeug.exceptions import HTTPException
 
 from app import app, babel
+from plugins import get_installed_plugins
 
 # We use URIs as identifiers throughout the application, meaning that
 # we never want werkzeug's merge_slashes feature.
@@ -46,6 +47,21 @@ def initialize_circulation_manager():
                     "Error instantiating circulation manager!"
                 )
                 raise
+
+            # Add plugins to the app
+            app.plugins = {}
+            plugins = get_installed_plugins()
+            for plugin_name, plugin_instace in plugins.items():
+                print('-------___')
+                print(plugin_name)
+                print(plugin_instace)
+                try:
+                    plugin_instace.activate(app)
+                except Exception as er:
+                    logging.warning("Unable to activate a plugin. Er: ", er)
+                    continue
+                app.plugins[plugin_name] = plugin_instace
+
             # Make sure that any changes to the database (as might happen
             # on initial setup) are committed before continuing.
             app.manager._db.commit()
@@ -646,3 +662,4 @@ def health_check():
 @app.route("/images/<filename>")
 def static_image(filename):
     return app.manager.static_files.image(filename)
+
