@@ -153,6 +153,8 @@ def setup_admin_controllers(manager):
     manager.admin_storage_services_controller = StorageServicesController(manager)
     from api.admin.controller.catalog_services import *
     manager.admin_catalog_services_controller = CatalogServicesController(manager)
+    from api.admin.controller.plugin_settings import PluginSettingsController
+    manager.admin_plugin_settings_controller = PluginSettingsController(manager)
 
 class AdminController(object):
 
