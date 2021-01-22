@@ -93,6 +93,7 @@ class TestPluginSettingsControllerGetValues(unittest.TestCase):
                                                          MockPluginWithoutDefault()).json
         assert "value" not in result["fields"][0]
 
+        with testApp.app_context():
             result = mocked_controller.get_plugin_fields("a-library", "a plugin",
                                                             MockPluginWithDefault()).json
         assert "value" in result["fields"][0]

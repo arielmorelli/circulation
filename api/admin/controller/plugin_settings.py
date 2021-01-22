@@ -27,6 +27,8 @@ class PluginSettingsController(SettingsController):
         try:
             fields_from_db = self._get_saved_values(library, plugin_name)
         except Exception as ex:
+            print("----------------")
+            print(ex)
             body = {"error": "Something went wrong, please try again"}
             return make_response(jsonify(body), 500, header)
 
@@ -122,6 +124,8 @@ class PluginSettingsController(SettingsController):
         self._db.commit()
 
     def _get_saved_values(self, library, plugin_name):
+        print(library)
+        print(plugin_name)
         response = self._db.query(ConfigurationSetting).filter(
             ConfigurationSetting.library_id == library.id,
             ConfigurationSetting.key.startswith(plugin_name)
@@ -138,4 +142,5 @@ class PluginSettingsController(SettingsController):
         )
         if not library:
             raise Exception("Library not found")
+        return library
 
