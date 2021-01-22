@@ -52,9 +52,6 @@ def initialize_circulation_manager():
             app.plugins = {}
             plugins = get_installed_plugins()
             for plugin_name, plugin_instace in plugins.items():
-                print('-------___')
-                print(plugin_name)
-                print(plugin_instace)
                 try:
                     plugin_instace.activate(app)
                 except Exception as er:

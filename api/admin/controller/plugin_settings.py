@@ -10,61 +10,132 @@ from core.model import (
 
 
 class PluginSettingsController(SettingsController):
-    def process_request(self, library_short_name, plugin_name, plugin):
-        if flask.request.method == 'GET':
-            return self.get_plugin_fields(plugin)
-        else:
-            # return self.process_post()
-            return "not implemented yet"
-
     def get_plugin_fields(self, library_short_name, plugin_name, plugin):
-        error = False
+        body = {}
+        header = {"Content-Type": "application/json"}
+
+        try:
+            library = self._get_library_from_short_name(library_short_name)
+        except Exception as ex:
+            body = {"error": "Library not found"}
+            return make_response(jsonify(body), 404, header)
+
+        if not hasattr(plugin, "FIELDS"):
+            body = {}
+            return make_response(jsonify(), 200, header)
+
+        try:
+            fields_from_db = self._get_saved_values(library, plugin_name)
+        except Exception as ex:
+            body = {"error": "Something went wrong, please try again"}
+            return make_response(jsonify(body), 500, header)
+
+        body = {
+            "fields": [{
+                "key": field.get("key"),
+                "label": field.get("label") ,
+                "description": field.get("description"),
+                "type": field.get("type"),
+                "required": field.get("required", False),
+                "default": field.get("default"),
+                "format": field.get("format"),
+                "options": field.get("options"),
+                "instructions": field.get("instructions"),
+                "capitalize": field.get("capitalize"),
+                "allowed": field.get("allowed"),
+            } for field in plugin.FIELDS]
+        }
+        for field in body["fields"]:
+            if field ["key"] == None:
+                continue
+            elif fields_from_db.get(field["key"]):
+                field["value"] = fields_from_db[field["key"]]._value
+            elif field["default"]:
+                field["value"] = field["default"]
+
+        return make_response(jsonify(body), 200, header)
+
+    def save_plugin_fields_value(self, library_short_name, plugin_name, plugin, new_values):
         body = {}
         header = {"Content-Type": "application/json"}
     
-        if hasattr(plugin, "FIELDS"):
-            try:
-                fields_value = self._get_saved_values(library_short_name, plugin_name)
-            except Exception as ex:
-                error = True
-                response_code = 404
-                body = {"error": "Library not found"}
+        try:
+            library = self._get_library_from_short_name(library_short_name)
+        except Exception as ex:
+            body = {"error": "Library not found"}
+            return make_response(jsonify(body), 404, header)
 
-            if not error:
-                response_code = 200
-                body = {
-                    "fields": [{
-                        "key": field.get("key"),
-                        "label": field.get("label") ,
-                        "description": field.get("description"),
-                        "type": field.get("type"),
-                        "required": field.get("required", False),
-                        "default": field.get("default"),
-                        "format": field.get("format"),
-                        "options": field.get("options"),
-                        "instructions": field.get("instructions"),
-                        "capitalize": field.get("capitalize"),
-                        "allowed": field.get("allowed"),
-                    } for field in plugin.FIELDS]
-                }
-                for entry in body["fields"]:
-                    if entry["key"] != None and (fields_value.get(entry["key"]) or entry["default"]):
-                       entry["value"] = fields_value.get(entry["key"], entry["default"])
+        if not hasattr(plugin, "FIELDS"):
+            body = {"error": "The plugin does not expect values"}
+            return make_response(jsonify(body), 401, header)
 
-        return make_response(jsonify(body), response_code, header)
+        try:
+            fields_from_db = self._get_saved_values(library, plugin_name)
+        except Exception as ex:
+            body = {"error": "Something went wrong, please try again"}
+            return make_response(jsonify(body), 500, header)
 
-    def _get_saved_values(self, library_short_name, plugin_name):
-        library = self._get_library_from_short_name(library_short_name)
-        if not library:
-            raise Exception("Library not found")
+        to_insert = [] # Expect list of {"id": <id>, "key": <key>, "value": <value>}
+        to_update = [] # Expect list of tuples: (<ConfigurationSetting instance>, <new_value>)
+        to_delete = [] # Expect list of ConfigurationSetting instaces
+
+        for key, value in new_values.items():
+            if key == None:
+                continue
+            elif not fields_from_db.get(key) and value is not None:
+                to_insert.append({ "id": library.id, "key": key, "value": value})
+            elif fields_from_db.get(key) and value is None:
+                to_delete.append(fields_from_db.get(key))
+            elif ( fields_from_db.get(key) and
+                  fields_from_db[key]._value != value ):
+                fields_from_db[key]._value = value
+                to_update.append( (fields_from_db[key], value) )
+        no_longer_exist_keys = set(fields_from_db.keys()) - set(new_values.keys())
+        to_delete = to_delete + [fields_from_db[key] for key in no_longer_exist_keys]
+
+        try:
+            self._perform_db_operations(to_insert, to_update, to_delete)
+        except Exception as ex:
+            response_code = 500
+            body = {"error": "Something went wrong while saving, please try again"}
+
+        return make_response(jsonify(body), 200, header)
+
+    def _perform_db_operations(self, to_insert, to_update, to_delete):
+        if not to_insert and not to_update and not to_delete:
+            return
+        try:
+            # Insert
+            [self._db.add(ConfigurationSetting(id=entry["id"],
+                                               key=entry["key"],
+                                               _value=entry["value"])
+                ) for entry in to_insert
+            ]
+            # Update
+            for entry in to_update:
+                entry[0]._value = entry[1]
+
+            # Delete
+            [self._db.delete(entry) for entry in to_delete]
+        except Exception as ex:
+            raise
+        self._db.commit()
+
+    def _get_saved_values(self, library, plugin_name):
         response = self._db.query(ConfigurationSetting).filter(
             ConfigurationSetting.library_id == library.id,
             ConfigurationSetting.key.startswith(plugin_name)
         ).all()
 
-        return {r.key[len(plugin_name)+1:]: r._value for r in response}
+        values = {}
+        for entry in response:
+            values[entry.key[len(plugin_name)+1:]] = entry
+        return values
 
     def _get_library_from_short_name(self, library_short_name):
-        return get_one(
+        library = get_one(
             self._db, Library, short_name=library_short_name,
         )
+        if not library:
+            raise Exception("Library not found")
+

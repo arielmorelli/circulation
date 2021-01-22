@@ -670,7 +670,7 @@ def admin_css():
 def list_plugins():
     return flask.jsonify({'available': [{"name": key} for key in app.plugins.keys()]})
 
-@app.route("/admin/plugin/<library_short_name>/<plugin_name>", methods=["GET"])
+@app.route("/admin/plugin/<library_short_name>/<plugin_name>", methods=["GET", "POST"])
 @returns_json_or_response_or_problem_detail
 @requires_admin
 @requires_csrf_token
@@ -679,8 +679,14 @@ def plugin_config_for_a_library(library_short_name, plugin_name):
     if not plugin:
         header = {"Content-Type": "application/json"}
         return make_response(jsonify({"error": "Plugin not found"}), 404, header)
-    else:
+    if flask.request.method == 'GET':
         return app.manager.admin_plugin_settings_controller.get_plugin_fields(library_short_name,
                                                                               plugin_name,
                                                                               plugin)
+    else:
+        return app.manager.admin_plugin_settings_controller.save_plugin_fields_value(
+                                                                              library_short_name,
+                                                                              plugin_name,
+                                                                              plugin,
+                                                                              flask.form)
 
