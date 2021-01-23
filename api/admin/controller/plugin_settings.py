@@ -27,8 +27,6 @@ class PluginSettingsController(SettingsController):
         try:
             fields_from_db = self._get_saved_values(library, plugin_name)
         except Exception as ex:
-            print("----------------")
-            print(ex)
             body = {"error": "Something went wrong, please try again"}
             return make_response(jsonify(body), 500, header)
 
@@ -85,13 +83,14 @@ class PluginSettingsController(SettingsController):
             if key == None:
                 continue
             elif not fields_from_db.get(key) and value is not None:
-                to_insert.append({ "id": library.id, "key": key, "value": value})
+                to_insert.append({ "lib_id": library.id, "key": plugin_name+"."+key, "value": value})
             elif fields_from_db.get(key) and value is None:
                 to_delete.append(fields_from_db.get(key))
             elif ( fields_from_db.get(key) and
                   fields_from_db[key]._value != value ):
                 fields_from_db[key]._value = value
                 to_update.append( (fields_from_db[key], value) )
+
         no_longer_exist_keys = set(fields_from_db.keys()) - set(new_values.keys())
         to_delete = to_delete + [fields_from_db[key] for key in no_longer_exist_keys]
 
@@ -108,7 +107,7 @@ class PluginSettingsController(SettingsController):
             return
         try:
             # Insert
-            [self._db.add(ConfigurationSetting(id=entry["id"],
+            [self._db.add(ConfigurationSetting(library_id=entry["lib_id"],
                                                key=entry["key"],
                                                _value=entry["value"])
                 ) for entry in to_insert
@@ -121,11 +120,13 @@ class PluginSettingsController(SettingsController):
             [self._db.delete(entry) for entry in to_delete]
         except Exception as ex:
             raise
-        self._db.commit()
+
+        try:
+            self._db.commit()
+        except Exception as ex:
+            self._db.rollback()
 
     def _get_saved_values(self, library, plugin_name):
-        print(library)
-        print(plugin_name)
         response = self._db.query(ConfigurationSetting).filter(
             ConfigurationSetting.library_id == library.id,
             ConfigurationSetting.key.startswith(plugin_name)

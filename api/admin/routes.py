@@ -688,5 +688,5 @@ def plugin_config_for_a_library(library_short_name, plugin_name):
                                                                               library_short_name,
                                                                               plugin_name,
                                                                               plugin,
-                                                                              flask.form)
+                                                                              flask.request.form)
 

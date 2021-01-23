@@ -175,6 +175,7 @@ class TestPluginSettingsControllerSaveValues(unittest.TestCase):
         
         key = "key-to-test"
         val = "value to test"
+        plugin_name = "plugin"
         data = {key: val}
         mocked_controller = self.MockPluginSettingsController(get_library=get_library,
                                                               get_values=get_values,
@@ -182,18 +183,19 @@ class TestPluginSettingsControllerSaveValues(unittest.TestCase):
                                                              )
         with testApp.app_context():
             result = mocked_controller.save_plugin_fields_value("library",
-                                                                "plugin",
+                                                                plugin_name,
                                                                 MockPluginWithDefault(),
                                                                 data).json
         assert "error" not in result
-        mocked_controller._perform_db_operations.assert_called_with([{"id": LIB_ID,
-                                                                      "key": key,
+        mocked_controller._perform_db_operations.assert_called_with([{"lib_id": LIB_ID,
+                                                                      "key": plugin_name + "." + key,
                                                                       "value": val}],
                                                                     [],
                                                                     [],
                                                                     )
 
     def test_insert_value_with_data_existing(self):
+        plugin_name = "plugin"
         new_key = "key-to-test"
         new_val = "value to test"
         key_to_keep = "key-to-keep"
@@ -211,13 +213,13 @@ class TestPluginSettingsControllerSaveValues(unittest.TestCase):
                                                              )
         with testApp.app_context():
             result = mocked_controller.save_plugin_fields_value("library",
-                                                                "plugin",
+                                                                plugin_name,
                                                                 MockPluginWithDefault(),
                                                                 data).json
         assert "error" not in result
         mocked_controller._perform_db_operations.assert_called_with(
-                                                                    [{"id": LIB_ID,
-                                                                      "key": new_key,
+                                                                    [{"lib_id": LIB_ID,
+                                                                      "key": plugin_name + "." +new_key,
                                                                       "value": new_val}],
                                                                     [],
                                                                     [],
@@ -330,6 +332,7 @@ class TestPluginSettingsControllerSaveValues(unittest.TestCase):
         mocked_controller._perform_db_operations.assert_called_with([], [], [val])
 
     def test_insert_one_update_one_delete_one_and_keep_one(self):
+        plugin_name = "plugin"
         id_to_update = 1
         key_to_insert = "key-to-insert"
         val_to_insert = "value to insert"
@@ -359,12 +362,12 @@ class TestPluginSettingsControllerSaveValues(unittest.TestCase):
                                                              )
         with testApp.app_context():
             result = mocked_controller.save_plugin_fields_value("library",
-                                                                "plugin",
+                                                                plugin_name,
                                                                 MockPluginWithDefault(),
                                                                 data).json
         assert "error" not in result
-        mocked_controller._perform_db_operations.assert_called_with( [{"id": LIB_ID,
-                                                                       "key": key_to_insert,
+        mocked_controller._perform_db_operations.assert_called_with( [{"lib_id": LIB_ID,
+                                                                       "key": plugin_name + '.' + key_to_insert,
                                                                        "value": val_to_insert}],
                                                                      [(val_to_update_old, val_to_update_new)],
                                                                      [val_to_delete]
