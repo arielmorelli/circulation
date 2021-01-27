@@ -38,7 +38,7 @@ class PluginSettingsController(SettingsController):
             return make_response(jsonify(body), 500, header)
 
         for field in body["fields"]:
-            if field ["key"] == None:
+            if field["key"] == None:
                 continue
             elif plugin_saved_values.get(field["key"]):
                 field["value"] = plugin_saved_values[field["key"]]._value

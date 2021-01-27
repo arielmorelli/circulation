@@ -2,16 +2,37 @@
 """ Run all plugins run plugin function. """
 import os
 import sys
+import logging
 bin_dir = os.path.split(__file__)[0]
 package_dir = os.path.join(bin_dir, "..")
 sys.path.append(os.path.abspath(package_dir))
 
-from api.plugins import get_installed_plugins
+from api.plugins import PluginController
 
-plugins = get_installed_plugins()
-for plugin in plugins.values():
-    try:
-        plugin.run_scripts()
-    except Exception as ex:
-        print(ex)
+target_script_name = None
+force = False
+pid = os.getpid()
+
+if len(sys.argv) > 3:
+    logging.error("Usage: %s [Script Name] [--force]" % sys.argv[0])
+    sys.exit()
+
+if len(sys.argv) == 2:
+    if sys.argv[1] == "--force":
+        force = True
+    else:
+        target_script_name = sys.argv[1]
+
+if len(sys.argv) == 3:
+    if sys.argv[1] == "--force":
+        force = True
+        target_script_name = sys.argv[2]
+    elif sys.argv[2] == "--force":
+        force = True
+        target_script_name = sys.argv[1]
+    else:
+        logging.error("Usage: %s [Script Name] [--force]" % sys.argv[0])
+        sys.exit()
+
+controller = PluginController(pid, target_script_name, force).run()
 
