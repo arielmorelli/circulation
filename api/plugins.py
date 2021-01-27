@@ -84,7 +84,15 @@ class PluginController(Script):
                 self._run_plugin(plugin_name, plugin_instance)
 
     def _run_plugin(self, plugin_name, plugin_instance):
-        if not self.force or not self._plugin_should_run(plugin_name, 1):
+        min_time_diff = 24 # hours
+        if hasattr(plugin_instance, "frequency"):
+            try:
+                min_time_diff = int(plugin_instance.frequency)
+            except:
+                logging.warning("Unable to cast frequency as int, using default value.")
+
+
+        if not self.force or not self._plugin_should_run(plugin_name, min_time_diff):
             logging.info("It is not time to run! You can force it using --force argument.")
             return
         try:
