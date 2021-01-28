@@ -6,7 +6,7 @@ from mock import MagicMock
 from flask import Flask
 from nose.tools import assert_raises
 
-from core.model.plugin import Plugin 
+from core.model.plugin_configuration import PluginConfiguration
 from core.model.library import Library
 from core.model import create
 from core.tests import DatabaseTest
@@ -93,7 +93,7 @@ class TestPluginSettingsControllerGetValues(DatabaseTest):
             self._db, Library, id=LIB_ID, name="a name", short_name=lib_name
         )
         create(
-            self._db, Plugin, id=2, library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
+            self._db, PluginConfiguration, id=2, library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
             _value=test_value
         )
 
@@ -168,7 +168,7 @@ class TestPluginSettingsControllerSaveValues(DatabaseTest):
             self._db, Library, id=LIB_ID, name="a name", short_name=lib_name
         )
         create(
-            self._db, Plugin, id=2, library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
+            self._db, PluginConfiguration, id=2, library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
             _value=test_value
         )
 
@@ -191,7 +191,7 @@ class TestPluginSettingsControllerSaveValues(DatabaseTest):
             self._db, Library, id=LIB_ID, name="a name", short_name=lib_name
         )
         create(
-            self._db, Plugin, id=2, library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
+            self._db, PluginConfiguration, id=2, library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
             _value=test_value+" old"
         )
 
@@ -215,7 +215,7 @@ class TestPluginSettingsControllerSaveValues(DatabaseTest):
             self._db, Library, id=LIB_ID, name="a name", short_name=lib_name
         )
         create(
-            self._db, Plugin, id=2, library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
+            self._db, PluginConfiguration, id=2, library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
             _value=test_value+" old"
         )
 

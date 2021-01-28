@@ -3,7 +3,7 @@ from flask import jsonify, make_response
 
 from . import SettingsController
 from core.model import get_one
-from core.model.plugin import Plugin
+from core.model.plugin_configuration import PluginConfiguration
 
 
 class PluginSettingsController(SettingsController):
@@ -32,7 +32,7 @@ class PluginSettingsController(SettingsController):
         }
 
         try:
-            plugin_saved_values = Plugin().get_saved_values(self._db, library_short_name, plugin_name)
+            plugin_saved_values = PluginConfiguration().get_saved_values(self._db, library_short_name, plugin_name)
         except:
             body = {"error": "Something went wrong, please try again."}
             return make_response(jsonify(body), 500, header)
@@ -56,7 +56,7 @@ class PluginSettingsController(SettingsController):
             return make_response(jsonify(body), 401, header)
 
         try:
-            plugin_saved_values = Plugin().save_values(self._db, library_short_name, plugin_name,
+            plugin_saved_values = PluginConfiguration().save_values(self._db, library_short_name, plugin_name,
                                                             new_values)
         except Exception as ex:
             body = {"error": "Something went wrong, please try again"}
