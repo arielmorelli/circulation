@@ -68,7 +68,7 @@ class PluginController(Script):
             self._session = _db
 
     def run(self):
-        if not self.force and not self.target_script_name and not self._should_run():
+        if not self._should_run() and not self.force and not self.target_script_name:
             logging.info("Another PluginController is running, finishing this one.")
             return
 
@@ -96,7 +96,7 @@ class PluginController(Script):
             logging.warning("Unable to convert FREQUENCY to int")
             return
 
-        if not self.force or not self._plugin_should_run(plugin_name, min_time_diff):
+        if not self._plugin_should_run(plugin_name, min_time_diff) and not self.force :
             logging.info("It is not time to run! You can force it using --force argument.")
             return
 
@@ -126,8 +126,10 @@ class PluginController(Script):
 
     def _plugin_should_run(self, plugin_name, min_diff_in_hours):
         srv_name = self._get_service_name(plugin_name)
-        finished_timestamp = Timestamp.value(self._db, srv_name, Timestamp.SCRIPT_TYPE, None)
-        if not finished_timestamp:
+        finished_timestamp = get_one(self._db, Timestamp, service=srv_name)
+        if finished_timestamp and finished_timestamp.finish:
+            finished_timestamp = finished_timestamp.finish
+        else:
             return True
         expires = finished_timestamp + datetime.timedelta(hours=min_diff_in_hours)
         now = datetime.datetime.utcnow()
