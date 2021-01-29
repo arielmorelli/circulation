@@ -13,7 +13,7 @@ class PluginSettingsController(SettingsController):
         body = {}
         header = {"Content-Type": "application/json"}
 
-        if not hasattr(plugin, "FIELDS"):
+        if not hasattr(plugin, "FIELDS") or not plugin.FIELDS:
             body = {}
             return make_response(jsonify(), 200, header)
 
