@@ -188,10 +188,10 @@ class TestPluginSettingsControllerSaveValues(DatabaseTest):
         test_value =  "a-value"
         
         library, _ = create(
-            self._db, Library, id=LIB_ID, name="a name", short_name=lib_name
+            self._db, Library, id=LIB_ID, name=lib_name, short_name=lib_name
         )
         create(
-            self._db, PluginConfiguration, id=2, library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
+            self._db, PluginConfiguration, id=2,library_id=library.id, key=plugin_name+"."+PLUGIN_KEY,
             _value=test_value+" old"
         )
 

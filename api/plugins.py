@@ -68,7 +68,7 @@ class PluginController(Script):
             self._session = _db
 
     def run(self):
-        if not self.force and not self.target_script_name and self._should_run():
+        if not self.force and not self.target_script_name and not self._should_run():
             logging.info("Another PluginController is running, finishing this one.")
             return
 
@@ -81,24 +81,48 @@ class PluginController(Script):
                 return
         else:
             for plugin_name, plugin_instance in self.plugins.items():
-                self._run_plugin(plugin_name, plugin_instance)
+                try:
+                    self._run_plugin(plugin_name, plugin_instance)
+                except Exception as err:
+                    logging.warning("Cannot run plugin %s. %s.", plugin_name, err)
 
     def _run_plugin(self, plugin_name, plugin_instance):
-        min_time_diff = 24 # hours
-        if hasattr(plugin_instance, "FREQUENCY"):
-            try:
-                min_time_diff = int(plugin_instance.frequency)
-            except:
+        logging.info("Start to run plugin %s", plugin_name)
+        if not hasattr(plugin_instance, "FREQUENCY"):
                 logging.warning("Unable to find FREQUENCY, use the script to run manually.")
-                return
+        try:
+            min_time_diff = int(plugin_instance.FREQUENCY)
+        except:
+            logging.warning("Unable to convert FREQUENCY to int")
+            return
 
         if not self.force or not self._plugin_should_run(plugin_name, min_time_diff):
             logging.info("It is not time to run! You can force it using --force argument.")
             return
+
+        start = datetime.datetime.utcnow()
         try:
             plugin_instance.run_scripts(plugin_name)
         except Exception as ex:
             logging.error("Erro while running script: %s. %s.", plugin_name, ex)
+        finish = datetime.datetime.utcnow()
+        self._update_plugin_last_run(plugin_name, start, finish)
+
+    def _update_plugin_last_run(self, plugin_name, start, finish):
+        srv_name = self._get_service_name(plugin_name)
+        timestamp = get_one(self._db, Timestamp, service=srv_name)
+        if not timestamp:
+            create(self._db, Timestamp, service=srv_name, start=start, finish=finish)
+        else:
+            timestamp.start = start
+            timestamp.finish = finish
+        try:
+            self._db.commit()
+        except Exception as er:
+            logging.error("Error while updating timestamp. Er: %s", er)
+            self._db.rollback()
+
+        logging.error("Plugin %s run in %d seconds", plugin_name, (finish-start).total_seconds())
 
     def _plugin_should_run(self, plugin_name, min_diff_in_hours):
         srv_name = self._get_service_name(plugin_name)
@@ -116,10 +140,9 @@ class PluginController(Script):
         response = get_one(self._db, ConfigurationSetting,
             ConfigurationSetting.key==self.KEY_NAME
         )
-
         if not response:
             create(
-                self._db, ConfigurationSetting, key=self.KEY_NAME
+                self._db, ConfigurationSetting, key=self.KEY_NAME, value=os.getpid()
             )
             return True
 

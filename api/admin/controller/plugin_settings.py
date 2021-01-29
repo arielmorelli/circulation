@@ -5,6 +5,8 @@ from . import SettingsController
 from core.model import get_one
 from core.model.plugin_configuration import PluginConfiguration
 
+import logging
+
 
 class PluginSettingsController(SettingsController):
     def get_plugin_fields(self, library_short_name, plugin_name, plugin):
@@ -32,7 +34,9 @@ class PluginSettingsController(SettingsController):
         }
 
         try:
-            plugin_saved_values = PluginConfiguration().get_saved_values(self._db, library_short_name, plugin_name)
+            plugin_saved_values = PluginConfiguration().get_saved_values(self._db,
+                                                                         library_short_name,
+                                                                         plugin_name)
         except:
             body = {"error": "Something went wrong, please try again."}
             return make_response(jsonify(body), 500, header)
@@ -41,7 +45,7 @@ class PluginSettingsController(SettingsController):
             if field["key"] == None:
                 continue
             elif plugin_saved_values.get(field["key"]):
-                field["value"] = plugin_saved_values[field["key"]]._value
+                field["value"] = plugin_saved_values[field["key"]]
             elif field["default"]:
                 field["value"] = field["default"]
 
@@ -56,9 +60,12 @@ class PluginSettingsController(SettingsController):
             return make_response(jsonify(body), 401, header)
 
         try:
-            plugin_saved_values = PluginConfiguration().save_values(self._db, library_short_name, plugin_name,
-                                                            new_values)
-        except Exception as ex:
+            plugin_saved_values = PluginConfiguration().save_values(self._db,
+                                                                    library_short_name,
+                                                                    plugin_name,
+                                                                    new_values)
+        except Exception as err:
+            logging.error("Cannot save. %s", err)
             body = {"error": "Something went wrong, please try again"}
             return make_response(jsonify(body), 500, header)
 
